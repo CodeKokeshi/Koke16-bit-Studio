@@ -5,7 +5,8 @@ import sys
 import numpy as np
 import sounddevice as sd
 
-from PyQt6.QtCore import QObject, QSettings, QThread, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, QSettings, QThread, QTimer, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QColor, QFont, QPainter, QPen
 from PyQt6.QtWidgets import QTabBar
 from PyQt6.QtWidgets import (
     QApplication,
@@ -16,10 +17,12 @@ from PyQt6.QtWidgets import (
     QLabel,
     QListWidget,
     QMainWindow,
+    QProgressBar,
     QProgressDialog,
     QPushButton,
     QInputDialog,
     QMenu,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -32,13 +35,15 @@ from PyQt6.QtWidgets import (
 )
 
 from daw.audio import AudioEngine
-from daw.dialogs import AddTrackDialog, HelpDialog, RoleInstrumentDialog, ShortcutSettingsDialog
+from daw.dialogs import AddTrackDialog, BeautifyDialog, GenerateMusicDialog, HelpDialog, RoleInstrumentDialog, ShortcutSettingsDialog
+from daw.generator import generate_music
 from daw.exporter import export_wav
 from daw.models import NoteEvent, Project, Track
 from daw.pianoroll import PianoRollEditor, midi_name
 from daw.project_io import ProjectFormatError, load_kokestudio_file, save_kokestudio_file
 from daw.transcriber import audio_to_multitrack_events, load_audio, TranscriptionCancelled
 from daw.instruments import INSTRUMENT_LIBRARY
+from daw.theory import SmartTheoryFixer, detect_track_role, remove_gaps, balance_tracks, fix_loops
 
 
 APP_QSS = """
@@ -46,14 +51,177 @@ QMainWindow, QWidget { background: #101010; color: #e7e7e7; font-family: Segoe U
 QPushButton { background: #1f1f1f; border: 1px solid #343434; border-radius: 6px; padding: 6px 10px; }
 QPushButton:hover { border-color: #00ffc8; color: #00ffc8; }
 QPushButton:checked { border-color: #00ffc8; color: #00ffc8; }
+QPushButton#playing { border-color: #ff4444; color: #ff4444; }
 QListWidget { background: #121212; border: 1px solid #2a2a2a; border-radius: 6px; }
+QListWidget::item { padding: 2px 4px; border-bottom: 1px solid #1a1a1a; }
+QListWidget::item:selected { background: #1a2e2a; border-left: 3px solid #00ffc8; }
+QListWidget::item:hover { background: #181818; }
 QFrame#panel { background: #111111; border: 1px solid #292929; border-radius: 8px; }
 QLabel#title { color: #00ffc8; font-size: 20px; font-weight: 700; }
+QLabel#trackName { font-size: 12px; font-weight: 600; color: #e0e0e0; }
+QLabel#trackMeta { font-size: 10px; color: #777777; }
+QLabel#trackRole { font-size: 10px; font-weight: 700; border-radius: 3px; padding: 1px 5px; }
+QProgressBar#volumeBar { background: #1a1a1a; border: none; border-radius: 2px; max-height: 4px; }
+QProgressBar#volumeBar::chunk { background: #00ffc8; border-radius: 2px; }
+QRadioButton { color: #e7e7e7; spacing: 6px; }
+QRadioButton::indicator { width: 14px; height: 14px; border: 2px solid #555555; border-radius: 9px; background: #1a1a1a; }
+QRadioButton::indicator:hover { border-color: #00ffc8; }
+QRadioButton::indicator:checked { border-color: #00ffc8; background: #00ffc8; }
+QRadioButton::indicator:checked:hover { background: #00ffc8; border-color: #00ffc8; }
+QRadioButton:disabled { color: #555555; }
+QRadioButton::indicator:disabled { border-color: #333333; background: #1a1a1a; }
+QCheckBox { color: #e7e7e7; spacing: 6px; }
+QCheckBox::indicator { width: 14px; height: 14px; border: 2px solid #555555; border-radius: 3px; background: #1a1a1a; }
+QCheckBox::indicator:hover { border-color: #00ffc8; }
+QCheckBox::indicator:checked { border-color: #00ffc8; background: #00ffc8; }
+QProgressDialog { min-width: 420px; }
 """
+
+# Role colours used in the track list
+_ROLE_COLORS: dict[str, str] = {
+    "lead": "#00ffc8",
+    "bass": "#ff8844",
+    "harmony": "#8888ff",
+    "drums": "#ff4488",
+    "unknown": "#666666",
+}
 
 
 class ImportCancelledError(Exception):
     pass
+
+
+# ── Live waveform widget (Audacity-style mic level) ─────────────────
+
+class WaveformWidget(QWidget):
+    """A small real-time waveform/level monitor."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(48)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._samples: np.ndarray = np.zeros(200, dtype=np.float32)
+        self._peak: float = 0.0
+        self._active = False
+
+    def set_active(self, on: bool):
+        self._active = on
+        if not on:
+            self._samples = np.zeros(200, dtype=np.float32)
+            self._peak = 0.0
+        self.update()
+
+    def push_audio(self, chunk: np.ndarray):
+        """Feed a new audio chunk (mono float32)."""
+        if len(chunk) == 0:
+            return
+        # Downsample to ~200 display points
+        step = max(1, len(chunk) // 200)
+        decimated = chunk[::step][:200]
+        buf = np.zeros(200, dtype=np.float32)
+        buf[:len(decimated)] = decimated
+        self._samples = buf
+        self._peak = float(np.max(np.abs(chunk)))
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+
+        # Background
+        p.fillRect(0, 0, w, h, QColor("#0a0a0a"))
+
+        if not self._active:
+            p.setPen(QColor("#444444"))
+            p.setFont(QFont("Segoe UI", 9))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Mic inactive")
+            p.end()
+            return
+
+        mid = h // 2
+        n = len(self._samples)
+
+        # Waveform
+        color = QColor("#00ffc8") if self._peak > 0.02 else QColor("#333333")
+        p.setPen(QPen(color, 1.2))
+        for i in range(1, min(n, w)):
+            x0 = int((i - 1) * w / n)
+            x1 = int(i * w / n)
+            y0 = int(mid - self._samples[i - 1] * mid * 0.9)
+            y1 = int(mid - self._samples[i] * mid * 0.9)
+            p.drawLine(x0, y0, x1, y1)
+
+        # Centre line
+        p.setPen(QPen(QColor("#333333"), 0.5))
+        p.drawLine(0, mid, w, mid)
+
+        # Peak meter bar at bottom (2px)
+        bar_w = int(min(self._peak, 1.0) * w)
+        if self._peak > 0.9:
+            bar_color = QColor("#ff4444")
+        elif self._peak > 0.5:
+            bar_color = QColor("#ffaa22")
+        else:
+            bar_color = QColor("#00ffc8")
+        p.fillRect(0, h - 3, bar_w, 3, bar_color)
+
+        # Level text
+        p.setPen(QColor("#888888"))
+        p.setFont(QFont("Segoe UI", 8))
+        db = 20 * np.log10(max(self._peak, 1e-6))
+        p.drawText(4, 12, f"{db:.0f} dB")
+
+        p.end()
+
+
+# ── Track item widget for rich list rendering ───────────────────────
+
+class TrackItemWidget(QWidget):
+    """Custom widget shown in each track list row."""
+
+    def __init__(self, track_name: str, instrument: str, note_count: int,
+                 volume_pct: int, role: str, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 3, 4, 3)
+        layout.setSpacing(6)
+
+        # Role colour dot + label
+        role_color = _ROLE_COLORS.get(role, _ROLE_COLORS["unknown"])
+        role_lbl = QLabel(role.upper() if role != "unknown" else "")
+        role_lbl.setObjectName("trackRole")
+        role_lbl.setStyleSheet(
+            f"background: {role_color}22; color: {role_color}; border: 1px solid {role_color}44;"
+        )
+        role_lbl.setFixedWidth(56)
+        role_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(role_lbl)
+
+        # Name + meta column
+        info = QVBoxLayout()
+        info.setSpacing(1)
+        info.setContentsMargins(0, 0, 0, 0)
+
+        name_lbl = QLabel(track_name)
+        name_lbl.setObjectName("trackName")
+        info.addWidget(name_lbl)
+
+        meta_lbl = QLabel(f"{instrument}  ·  {note_count} notes")
+        meta_lbl.setObjectName("trackMeta")
+        info.addWidget(meta_lbl)
+
+        layout.addLayout(info, 1)
+
+        # Mini volume bar
+        vol_bar = QProgressBar()
+        vol_bar.setObjectName("volumeBar")
+        vol_bar.setRange(0, 100)
+        vol_bar.setValue(volume_pct)
+        vol_bar.setTextVisible(False)
+        vol_bar.setFixedWidth(50)
+        vol_bar.setFixedHeight(4)
+        layout.addWidget(vol_bar, 0, Qt.AlignmentFlag.AlignVCenter)
 
 
 class ImportProgressDialog(QProgressDialog):
@@ -251,10 +419,20 @@ class MainWindow(QMainWindow):
         self.btn_play_all = QPushButton("▶ Play All Tracks")
         self.btn_play_this = QPushButton("▷ Play This Track")
         self.btn_stop = QPushButton("■ Stop")
+        self.btn_beautify = QPushButton("✨ Beautify")
+        self.btn_remove_gaps = QPushButton("⊟ Remove Gaps")
+        self.btn_balance = QPushButton("⚖ Balance")
+        self.btn_fix_loops = QPushButton("🔁 Fix Loops")
+        self.btn_generate = QPushButton("🎵 Generate")
         studio_toolbar_layout.addWidget(self.btn_add_track)
         studio_toolbar_layout.addWidget(self.btn_play_all)
         studio_toolbar_layout.addWidget(self.btn_play_this)
         studio_toolbar_layout.addWidget(self.btn_stop)
+        studio_toolbar_layout.addWidget(self.btn_beautify)
+        studio_toolbar_layout.addWidget(self.btn_remove_gaps)
+        studio_toolbar_layout.addWidget(self.btn_balance)
+        studio_toolbar_layout.addWidget(self.btn_fix_loops)
+        studio_toolbar_layout.addWidget(self.btn_generate)
 
         bpm_label = QLabel("BPM")
         self.spin_bpm = QSpinBox()
@@ -303,8 +481,13 @@ class MainWindow(QMainWindow):
 
         left_l.addWidget(QLabel("Tracks"))
         self.list_tracks = QListWidget()
+        self.list_tracks.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.list_tracks.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         left_l.addWidget(self.list_tracks, 1)
+
+        # Live waveform monitor (for hum recording)
+        self.waveform_widget = WaveformWidget()
+        left_l.addWidget(self.waveform_widget)
 
         self.track_volume = QSlider(Qt.Orientation.Horizontal)
         self.track_volume.setRange(0, 100)
@@ -327,10 +510,16 @@ class MainWindow(QMainWindow):
         self.center_stack = QStackedWidget()
 
         self.empty_view = QLabel(
-            "Blank canvas\n\nClick '+ Add Piano Roll Track' to choose an instrument and create your first track."
+            "✨ Welcome to Koke16-Bit Studio\n\n"
+            "Get started:\n"
+            "  🎵  Generate → auto-create a multi-track song\n"
+            "  ＋  Add Piano Roll Track → compose from scratch\n"
+            "  🎙  Hum → Music → sing into your mic\n"
+            "  📁  Import Audio → convert a WAV file\n\n"
+            "Tip: Use Ctrl+Click to multi-select tracks in the left panel."
         )
         self.empty_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.empty_view.setStyleSheet("color:#6f6f6f; font-size:14px;")
+        self.empty_view.setStyleSheet("color:#6f6f6f; font-size:13px; line-height:1.6;")
         self.center_stack.addWidget(self.empty_view)
 
         self.editor = PianoRollEditor()
@@ -412,6 +601,11 @@ class MainWindow(QMainWindow):
         self.btn_play_all.clicked.connect(self._on_play_all)
         self.btn_play_this.clicked.connect(self._on_play_this)
         self.btn_stop.clicked.connect(self._on_stop)
+        self.btn_beautify.clicked.connect(self._on_beautify)
+        self.btn_remove_gaps.clicked.connect(self._on_remove_gaps)
+        self.btn_balance.clicked.connect(self._on_balance)
+        self.btn_fix_loops.clicked.connect(self._on_fix_loops)
+        self.btn_generate.clicked.connect(self._on_generate)
         self.btn_export.clicked.connect(self._on_export_wav)
         self.spin_bpm.valueChanged.connect(self._on_bpm_changed)
         self.combo_loop_mode.currentIndexChanged.connect(self._on_loop_mode_changed)
@@ -636,7 +830,14 @@ class MainWindow(QMainWindow):
         self._hum_chunks = []
         self._hum_recording = True
         self.btn_hum_music.setText("⏹ Stop Hum")
-        self.status.showMessage("Hum capture started... click again to stop and process.")
+        self.btn_hum_music.setStyleSheet("border-color: #ff4444; color: #ff4444;")
+        self.waveform_widget.set_active(True)
+        self.status.showMessage("🎙 Recording – hum/sing into your mic. Click Stop Hum when done.")
+
+        # Timer to feed waveform display ~30 fps
+        self._hum_display_timer = QTimer(self)
+        self._hum_display_timer.setInterval(33)
+        self._hum_display_timer.timeout.connect(self._update_hum_waveform)
 
         def _callback(indata, frames, time_info, status):
             if self._hum_recording:
@@ -650,15 +851,27 @@ class MainWindow(QMainWindow):
                 callback=_callback,
             )
             self._hum_stream.start()
+            self._hum_display_timer.start()
         except Exception:
             self._hum_recording = False
             self._hum_stream = None
             self.btn_hum_music.setText("🎙 Hum → Music")
-            self.status.showMessage("Microphone unavailable.", 3000)
+            self.btn_hum_music.setStyleSheet("")
+            self.waveform_widget.set_active(False)
+            self.status.showMessage("⚠ Microphone unavailable – check your audio device.", 4000)
+
+    def _update_hum_waveform(self):
+        """Feed the latest captured audio chunk to the waveform widget."""
+        if self._hum_chunks:
+            self.waveform_widget.push_audio(self._hum_chunks[-1])
 
     def _stop_hum_capture_and_process(self):
         self._hum_recording = False
         self.btn_hum_music.setText("🎙 Hum → Music")
+        self.btn_hum_music.setStyleSheet("")
+        if hasattr(self, "_hum_display_timer"):
+            self._hum_display_timer.stop()
+        self.waveform_widget.set_active(False)
         if self._hum_stream is not None:
             self._hum_stream.stop()
             self._hum_stream.close()
@@ -709,13 +922,13 @@ class MainWindow(QMainWindow):
         progress = ImportProgressDialog("Preparing audio analysis...", "Cancel", 0, 100, self)
         progress.setWindowTitle("Importing Audio")
         progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumWidth(480)
         progress.setAutoClose(False)
         progress.setAutoReset(False)
         progress.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
         progress.setWindowFlag(Qt.WindowType.MSWindowsFixedSizeDialogHint, True)
         progress.setValue(0)
         progress.show()
-        progress.setFixedSize(progress.sizeHint())
         self._import_progress_dialog = progress
 
         self._import_thread = QThread(self)
@@ -833,6 +1046,28 @@ class MainWindow(QMainWindow):
             self.status.showMessage("No clear parts detected for auto-retrofy.", 3000)
             return
 
+        # Offer to clear existing tracks before importing
+        if self.project.tracks:
+            clear_answer = QMessageBox.question(
+                self,
+                "Clear Existing Tracks?",
+                "There are existing tracks on the canvas.\n\n"
+                "Yes = delete all current tracks before importing\n"
+                "No = keep them and add imported tracks alongside",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Yes,
+            )
+            if clear_answer == QMessageBox.StandardButton.Cancel:
+                self.status.showMessage(f"{source_label} import cancelled.", 2500)
+                return
+            if clear_answer == QMessageBox.StandardButton.Yes:
+                if self.audio.playing:
+                    self.audio.stop()
+                self.project.tracks.clear()
+                self.project.selected_track_index = -1
+                self.audio._cache.clear()
+
         answer = QMessageBox.question(
             self,
             "Auto-select instruments?",
@@ -886,7 +1121,18 @@ class MainWindow(QMainWindow):
     def _refresh_track_list(self):
         self.list_tracks.clear()
         for track in self.project.tracks:
-            self.list_tracks.addItem(f"{track.name}  [{track.instrument_name}]")
+            role = detect_track_role(track.notes, track.instrument_name, track.name)
+            widget = TrackItemWidget(
+                track_name=track.name,
+                instrument=track.instrument_name,
+                note_count=len(track.notes),
+                volume_pct=int(track.volume * 100),
+                role=role,
+            )
+            item = QListWidgetItem()
+            item.setSizeHint(widget.sizeHint())
+            self.list_tracks.addItem(item)
+            self.list_tracks.setItemWidget(item, widget)
 
         has_tracks = len(self.project.tracks) > 0
         self.btn_save_project.setEnabled(has_tracks)
@@ -913,12 +1159,21 @@ class MainWindow(QMainWindow):
         self.track_volume.blockSignals(True)
         self.track_volume.setValue(int(track.volume * 100))
         self.track_volume.blockSignals(False)
-        self.status.showMessage(f"Editing {track.name}", 2000)
+
+        selected = self._get_selected_track_rows()
+        if len(selected) > 1:
+            self.status.showMessage(f"{len(selected)} tracks selected", 2000)
+        else:
+            self.status.showMessage(f"Editing {track.name}", 2000)
 
     def _on_track_volume_changed(self, value: int):
-        track = self.project.selected_track
-        if track:
-            track.volume = value / 100.0
+        """Apply volume to all selected tracks (multi-select aware)."""
+        rows = self._get_selected_track_rows()
+        if rows:
+            for r in rows:
+                self.project.tracks[r].volume = value / 100.0
+        elif self.project.selected_track:
+            self.project.selected_track.volume = value / 100.0
 
     def _on_note_selected(self, note_obj):
         self._active_note = note_obj
@@ -977,12 +1232,31 @@ class MainWindow(QMainWindow):
             self.editor.set_playhead(tick)
         self.status.showMessage(f"Start Here set to tick {tick}", 1500)
 
+    def _set_playing_style(self, active: bool):
+        """Toggle visual state on playback buttons."""
+        if active:
+            self.btn_play_all.setObjectName("playing")
+            self.btn_play_this.setObjectName("playing")
+            self.btn_stop.setStyleSheet(
+                "QPushButton { background-color: #cc2244; color: #ffffff; }"
+            )
+        else:
+            self.btn_play_all.setObjectName("")
+            self.btn_play_this.setObjectName("")
+            self.btn_stop.setStyleSheet("")
+        # Force style refresh
+        self.btn_play_all.style().unpolish(self.btn_play_all)
+        self.btn_play_all.style().polish(self.btn_play_all)
+        self.btn_play_this.style().unpolish(self.btn_play_this)
+        self.btn_play_this.style().polish(self.btn_play_this)
+
     def _on_play_all(self):
         if not self.project.tracks:
             self.status.showMessage("Add at least one track first.", 2000)
             return
         self.audio.start(solo_track_index=None, start_tick=self._play_start_tick)
-        self.status.showMessage("Playback started: all tracks", 1500)
+        self._set_playing_style(True)
+        self.status.showMessage("\u25b6 Playing all tracks", 1500)
 
     def _on_play_this(self):
         row = self.list_tracks.currentRow()
@@ -990,39 +1264,448 @@ class MainWindow(QMainWindow):
             self.status.showMessage("Select a track first.", 2000)
             return
         self.audio.start(solo_track_index=row, start_tick=self._play_start_tick)
-        self.status.showMessage(f"Playback started: {self.project.tracks[row].name}", 1500)
+        self._set_playing_style(True)
+        self.status.showMessage(f"\u25b7 Playing: {self.project.tracks[row].name}", 1500)
 
     def _on_stop(self):
         self.audio.stop()
-        self.status.showMessage("Playback stopped", 1500)
+        self._set_playing_style(False)
+        self.status.showMessage("\u25a0 Playback stopped", 1500)
+
+    # ── Beautify ───────────────────────────────────────────────────
+
+    def _on_beautify(self):
+        """Analyse tracks and apply role-specific music-theory beautification."""
+        if not self.project.tracks:
+            QMessageBox.information(self, "Beautify", "No tracks to beautify.")
+            return
+
+        # Determine current track name (if any)
+        sel = self.project.selected_track
+        cur_name = sel.name if sel else None
+
+        dlg = BeautifyDialog(cur_name, self)
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return
+
+        apply_all = dlg.apply_to_all()
+        loop_aware = dlg.loop_aware()
+
+        if apply_all:
+            targets = list(range(len(self.project.tracks)))
+        else:
+            idx = self.project.selected_track_index
+            if idx < 0 or idx >= len(self.project.tracks):
+                QMessageBox.warning(self, "Beautify", "No track selected.")
+                return
+            targets = [idx]
+
+        try:
+            fixer = SmartTheoryFixer(strictness=0.75)
+            summary_lines: list[str] = []
+
+            for ti in targets:
+                track = self.project.tracks[ti]
+                if not track.notes:
+                    summary_lines.append(f"  {track.name}: skipped (no notes)")
+                    continue
+
+                # Auto-detect role from notes + instrument + track name
+                role = detect_track_role(
+                    track.notes,
+                    waveform=track.waveform,
+                    instrument_name=track.instrument_name,
+                    track_name=track.name,
+                )
+
+                before_count = len(track.notes)
+                track.notes = fixer.beautify(
+                    track.notes,
+                    role=role,
+                    ticks_per_beat=self.project.ticks_per_beat,
+                )
+                after_count = len(track.notes)
+
+                summary_lines.append(
+                    f"  {track.name}: detected as {role.upper()} "
+                    f"({before_count}→{after_count} notes)"
+                )
+
+            if loop_aware:
+                all_notes = [t.notes for t in self.project.tracks]
+                balanced = balance_tracks(all_notes, self.project.ticks_per_beat)
+                stabilized = fix_loops(balanced, self.project.ticks_per_beat)
+                for i, tr in enumerate(self.project.tracks):
+                    tr.notes = stabilized[i]
+                summary_lines.append("")
+                summary_lines.append("Loop-aware post-pass applied:")
+                summary_lines.append("  • Balanced track lengths to shared loop boundary")
+                summary_lines.append("  • Smoothed end→start transition for seamless restart")
+
+            # Refresh the piano-roll if the current track was touched
+            if self.project.selected_track_index in targets:
+                track = self.project.tracks[self.project.selected_track_index]
+                self.editor.set_track(track)
+
+            # Invalidate audio cache (note data changed)
+            self.audio._cache.clear()
+
+            summary = "\n".join(summary_lines)
+            QMessageBox.information(
+                self,
+                "✨ Beautify Complete",
+                (
+                    "Music-theory beautification applied"
+                    + (" (loop-aware mode):" if loop_aware else ":")
+                    + f"\n\n{summary}"
+                ),
+            )
+            self.status.showMessage(
+                "Beautify complete (loop-aware)." if loop_aware else "Beautify complete.",
+                3000,
+            )
+
+        except Exception as exc:
+            QMessageBox.warning(self, "Beautify Error", str(exc))
+
+    # ── Remove Gaps ────────────────────────────────────────────────
+
+    def _on_remove_gaps(self):
+        """Remove dead-space gaps from tracks without fusing notes."""
+        if not self.project.tracks:
+            QMessageBox.information(self, "Remove Gaps", "No tracks to process.")
+            return
+
+        sel = self.project.selected_track
+        cur_name = sel.name if sel else None
+
+        # Reuse the same "current / all" dialog pattern
+        choices = ["Current track only", "All tracks"]
+        if cur_name:
+            choices[0] = f"Current track only ({cur_name})"
+
+        choice, ok = QInputDialog.getItem(
+            self, "⊟ Remove Gaps",
+            "Remove empty space (gaps) from:",
+            choices, 0, False,
+        )
+        if not ok:
+            return
+
+        apply_all = "All" in choice
+
+        if apply_all:
+            targets = list(range(len(self.project.tracks)))
+        else:
+            idx = self.project.selected_track_index
+            if idx < 0 or idx >= len(self.project.tracks):
+                QMessageBox.warning(self, "Remove Gaps", "No track selected.")
+                return
+            targets = [idx]
+
+        try:
+            summary_lines: list[str] = []
+            for ti in targets:
+                track = self.project.tracks[ti]
+                if not track.notes:
+                    summary_lines.append(f"  {track.name}: skipped (no notes)")
+                    continue
+
+                # Compute the span before and after
+                old_end = max(n.start_tick + n.length_tick for n in track.notes)
+                track.notes = remove_gaps(track.notes, min_gap=2)
+                new_end = max(n.start_tick + n.length_tick for n in track.notes) if track.notes else 0
+
+                saved = old_end - new_end
+                summary_lines.append(
+                    f"  {track.name}: {saved} ticks of dead space removed"
+                )
+
+            # Refresh editor
+            if self.project.selected_track_index in targets:
+                track = self.project.tracks[self.project.selected_track_index]
+                self.editor.set_track(track)
+
+            self.audio._cache.clear()
+
+            summary = "\n".join(summary_lines)
+            QMessageBox.information(
+                self,
+                "⊟ Gaps Removed",
+                f"Dead space removed:\n\n{summary}",
+            )
+            self.status.showMessage("Gaps removed.", 3000)
+
+        except Exception as exc:
+            QMessageBox.warning(self, "Remove Gaps Error", str(exc))
+
+    # ── Balance Tracks ─────────────────────────────────────────────
+
+    def _on_balance(self):
+        """Extend shorter tracks so all tracks match the longest one."""
+        if len(self.project.tracks) < 2:
+            QMessageBox.information(
+                self, "Balance",
+                "Need at least 2 tracks to balance."
+            )
+            return
+
+        try:
+            # Gather all note lists
+            all_notes = [t.notes for t in self.project.tracks]
+            ends_before = [max((n.start_tick + n.length_tick for n in t.notes), default=0)
+                           for t in self.project.tracks]
+            target_end = max(ends_before)
+
+            balanced = balance_tracks(all_notes, self.project.ticks_per_beat)
+
+            summary_lines: list[str] = []
+            for i, track in enumerate(self.project.tracks):
+                old_end = ends_before[i]
+                track.notes = balanced[i]
+                new_end = max((n.start_tick + n.length_tick for n in track.notes), default=0)
+                if new_end > old_end:
+                    added = new_end - old_end
+                    summary_lines.append(
+                        f"  {track.name}: extended by {added} ticks "
+                        f"({old_end}→{new_end})"
+                    )
+                else:
+                    summary_lines.append(
+                        f"  {track.name}: already at max length"
+                    )
+
+            # Refresh editor
+            if 0 <= self.project.selected_track_index < len(self.project.tracks):
+                self.editor.set_track(
+                    self.project.tracks[self.project.selected_track_index]
+                )
+
+            self.audio._cache.clear()
+            self._refresh_track_list()
+
+            summary = "\n".join(summary_lines)
+            QMessageBox.information(
+                self,
+                "⚖ Balance Complete",
+                f"All tracks now match the longest track ({target_end} ticks):\n\n{summary}",
+            )
+            self.status.showMessage("Tracks balanced.", 3000)
+
+        except Exception as exc:
+            QMessageBox.warning(self, "Balance Error", str(exc))
+
+    # ── Fix Loops ──────────────────────────────────────────────────
+
+    def _on_fix_loops(self):
+        """Smooth the end→start transition for seamless looping."""
+        if not self.project.tracks:
+            QMessageBox.information(
+                self, "Fix Loops", "No tracks to process."
+            )
+            return
+
+        has_notes = any(t.notes for t in self.project.tracks)
+        if not has_notes:
+            QMessageBox.information(
+                self, "Fix Loops", "All tracks are empty — nothing to fix."
+            )
+            return
+
+        try:
+            all_notes = [t.notes for t in self.project.tracks]
+            fixed = fix_loops(all_notes, self.project.ticks_per_beat)
+
+            summary_lines: list[str] = []
+            for i, track in enumerate(self.project.tracks):
+                old_count = len(track.notes)
+                old_end = max((n.start_tick + n.length_tick for n in track.notes), default=0)
+                track.notes = fixed[i]
+                new_count = len(track.notes)
+                new_end = max((n.start_tick + n.length_tick for n in track.notes), default=0)
+
+                changes: list[str] = []
+                if new_count != old_count:
+                    changes.append(f"{old_count}→{new_count} notes")
+                if new_end != old_end:
+                    changes.append(f"end {old_end}→{new_end}")
+                if changes:
+                    summary_lines.append(
+                        f"  {track.name}: {', '.join(changes)}"
+                    )
+                else:
+                    summary_lines.append(
+                        f"  {track.name}: no changes needed"
+                    )
+
+            # Refresh editor
+            if 0 <= self.project.selected_track_index < len(self.project.tracks):
+                self.editor.set_track(
+                    self.project.tracks[self.project.selected_track_index]
+                )
+
+            self.audio._cache.clear()
+            self._refresh_track_list()
+
+            summary = "\n".join(summary_lines)
+            QMessageBox.information(
+                self,
+                "🔁 Loops Fixed",
+                "Seamless loop transitions applied:\n\n"
+                "• Velocity crossfade at boundaries\n"
+                "• Pitch contour smoothed for wrap-around\n"
+                "• Rhythmic alignment to bar boundaries\n"
+                "• Bridge / pickup notes added where needed\n\n"
+                f"{summary}",
+            )
+            self.status.showMessage("Loop transitions smoothed.", 3000)
+
+        except Exception as exc:
+            QMessageBox.warning(self, "Fix Loops Error", str(exc))
+
+    # ── Generate Music ─────────────────────────────────────────────
+
+    def _on_generate(self):
+        """Open genre picker and generate multi-track music."""
+        try:
+            dialog = GenerateMusicDialog(self)
+            if dialog.exec() != dialog.DialogCode.Accepted:
+                return
+            genre = dialog.selected_genre()
+            if not genre:
+                return
+
+            # Offer to clear existing tracks
+            if self.project.tracks:
+                answer = QMessageBox.question(
+                    self,
+                    "Clear Existing Tracks?",
+                    "There are existing tracks on the canvas.\n\n"
+                    "Yes = delete all current tracks before generating\n"
+                    "No = keep them and add generated tracks alongside",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if answer == QMessageBox.StandardButton.Cancel:
+                    return
+                if answer == QMessageBox.StandardButton.Yes:
+                    if self.audio.playing:
+                        self.audio.stop()
+                    self.project.tracks.clear()
+                    self.project.selected_track_index = -1
+                    self.audio._cache.clear()
+
+            from daw.generator import generate_music as _gen, _NOTE_NAMES
+
+            loop_mode = dialog.is_loop_mode()
+            result = _gen(genre, loop_friendly=loop_mode,
+                          bars_override=dialog.selected_bars())
+
+            # Update BPM
+            self.project.bpm = result.bpm
+            self.spin_bpm.setValue(result.bpm)
+
+            root_name = _NOTE_NAMES[result.root_note]
+            scale_label = result.scale_name.replace("_", " ").title()
+
+            # Create tracks from the generated result
+            for gt in result.tracks:
+                track_name = f"{genre} {gt.role}"
+                track = Track(
+                    name=track_name,
+                    instrument_name=gt.instrument_name,
+                    waveform=gt.waveform,
+                    volume=gt.volume,
+                    notes=list(gt.notes),
+                )
+                self.project.tracks.append(track)
+
+            # Select the first generated track (Lead)
+            first_idx = len(self.project.tracks) - len(result.tracks)
+            self.project.selected_track_index = first_idx
+            self._refresh_track_list()
+            self.list_tracks.setCurrentRow(first_idx)
+
+            self.audio._cache.clear()
+
+            mode_label = "Loop-friendly" if loop_mode else "One-time"
+            QMessageBox.information(
+                self,
+                "🎵 Music Generated",
+                f"Genre: {genre}\n"
+                f"Key: {root_name} {scale_label}\n"
+                f"BPM: {result.bpm}\n"
+                f"Mode: {mode_label}\n"
+                f"Tracks: {len(result.tracks)} "
+                f"({', '.join(t.role for t in result.tracks)})\n"
+                f"Length: {result.total_ticks} ticks",
+            )
+            self.status.showMessage(
+                f"Generated {genre} music in {root_name} {scale_label} @ {result.bpm} BPM",
+                5000,
+            )
+
+        except Exception as exc:
+            QMessageBox.warning(self, "Generate Error", str(exc))
+
+    # ── end Generate ───────────────────────────────────────────────
+
+    def _get_selected_track_rows(self) -> list[int]:
+        """Return sorted list of currently selected track row indices."""
+        return sorted({idx.row() for idx in self.list_tracks.selectedIndexes()
+                       if 0 <= idx.row() < len(self.project.tracks)})
 
     def _on_tracks_context_menu(self, pos):
         row = self.list_tracks.indexAt(pos).row()
         if row < 0 or row >= len(self.project.tracks):
             return
 
-        self.list_tracks.setCurrentRow(row)
+        # Ensure right-clicked row is part of the selection
+        if row not in self._get_selected_track_rows():
+            self.list_tracks.setCurrentRow(row)
+
+        selected_rows = self._get_selected_track_rows()
+        multi = len(selected_rows) > 1
 
         menu = QMenu(self)
-        action_delete = menu.addAction("Delete Track")
-        action_change_inst = menu.addAction("Change Instrument")
+        if multi:
+            action_delete = menu.addAction(f"Delete {len(selected_rows)} Tracks")
+            action_change_inst = None  # not available for multi-select
+        else:
+            action_delete = menu.addAction("Delete Track")
+            action_change_inst = menu.addAction("Change Instrument")
+
+        menu.addSeparator()
+        action_select_all = menu.addAction("Select All Tracks")
+
         chosen = menu.exec(self.list_tracks.mapToGlobal(pos))
 
         if chosen == action_delete:
-            self._on_delete_selected_track()
-        elif chosen == action_change_inst:
+            self._on_delete_selected_tracks()
+        elif action_change_inst and chosen == action_change_inst:
             self._on_change_instrument_selected_track()
+        elif chosen == action_select_all:
+            self.list_tracks.selectAll()
 
-    def _on_delete_selected_track(self):
-        row = self.list_tracks.currentRow()
-        if row < 0 or row >= len(self.project.tracks):
+    def _on_delete_selected_tracks(self):
+        """Delete all currently selected tracks (supports multi-select)."""
+        rows = self._get_selected_track_rows()
+        if not rows:
             return
 
-        track = self.project.tracks[row]
+        # Build confirmation message
+        if len(rows) == 1:
+            track = self.project.tracks[rows[0]]
+            msg = f"Delete track '{track.name}'?"
+        else:
+            names = [self.project.tracks[r].name for r in rows]
+            msg = f"Delete {len(rows)} tracks?\n\n" + "\n".join(f"  • {n}" for n in names)
+
         answer = QMessageBox.question(
             self,
-            "Delete Track",
-            f"Delete track '{track.name}'?",
+            "Delete Tracks" if len(rows) > 1 else "Delete Track",
+            msg,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -1032,19 +1715,21 @@ class MainWindow(QMainWindow):
         if self.audio.playing:
             self.audio.stop()
 
-        del self.project.tracks[row]
+        # Remove from highest index first to preserve lower indices
+        for r in reversed(rows):
+            del self.project.tracks[r]
 
         if not self.project.tracks:
             self.project.selected_track_index = -1
             self._refresh_track_list()
-            self.status.showMessage("Track deleted.", 2000)
+            self.status.showMessage(f"{len(rows)} track(s) deleted.", 2000)
             return
 
-        new_row = min(row, len(self.project.tracks) - 1)
+        new_row = min(rows[0], len(self.project.tracks) - 1)
         self.project.selected_track_index = new_row
         self._refresh_track_list()
         self.list_tracks.setCurrentRow(new_row)
-        self.status.showMessage("Track deleted.", 2000)
+        self.status.showMessage(f"{len(rows)} track(s) deleted.", 2000)
 
     def _on_change_instrument_selected_track(self):
         row = self.list_tracks.currentRow()

@@ -31,7 +31,7 @@ class AudioEngine(QObject):
             if not pygame.mixer.get_init():
                 pygame.mixer.pre_init(self.sample_rate, -16, 1, 512)
                 pygame.mixer.init()
-            pygame.mixer.set_num_channels(32)
+            pygame.mixer.set_num_channels(64)
             self.available = True
         except Exception:
             self.available = False
@@ -80,12 +80,13 @@ class AudioEngine(QObject):
         for track in self._playback_tracks():
             for note in track.notes:
                 if note.start_tick == self.current_tick:
-                    dur = max(0.08, note.length_tick / self.project.ticks_per_beat * 60.0 / self.project.bpm)
+                    dur = max(0.04, note.length_tick / self.project.ticks_per_beat * 60.0 / self.project.bpm)
                     vel_amp = max(0.05, min(1.0, note.velocity / 127.0))
                     sound = self._get_sound(track.waveform, note.midi_note, dur)
                     ch = pygame.mixer.find_channel(True)
-                    ch.set_volume(vel_amp * track.volume)
-                    ch.play(sound)  # type: ignore[arg-type]
+                    if ch is not None:
+                        ch.set_volume(vel_amp * track.volume)
+                        ch.play(sound)  # type: ignore[arg-type]
 
         next_tick = self.current_tick + 1
         self.current_tick = loop_start if next_tick >= loop_end else next_tick
@@ -163,13 +164,20 @@ class AudioEngine(QObject):
         else:
             wave = np.sin(2.0 * np.pi * freq * t).astype(np.float32)
 
+        # Envelope: match exporter exactly (attack 5ms, release 80ms)
         attack = min(int(0.005 * self.sample_rate), n_samples // 4)
         release = min(int(0.08 * self.sample_rate), n_samples // 2)
         env = np.ones(n_samples, dtype=np.float32)
         if attack > 0:
-            env[:attack] = np.linspace(0.0, 1.0, attack)
+            env[:attack] = np.linspace(0.0, 1.0, attack, dtype=np.float32)
         if release > 0:
-            env[-release:] = np.linspace(1.0, 0.0, release)
+            env[-release:] = np.linspace(1.0, 0.0, release, dtype=np.float32)
 
-        samples = np.ascontiguousarray(np.clip(wave * env * amp, -1.0, 1.0) * 32767, dtype=np.int16)
+        shaped = np.clip(wave * env * amp, -1.0, 1.0)
+
+        # Append a tiny silent tail to prevent click when channel is reused
+        tail = np.zeros(int(0.005 * self.sample_rate), dtype=np.float32)
+        shaped = np.concatenate([shaped, tail])
+
+        samples = np.ascontiguousarray(shaped * 32767, dtype=np.int16)
         return pygame.mixer.Sound(samples)

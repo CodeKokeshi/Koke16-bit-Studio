@@ -181,11 +181,10 @@ def render_project(
                         f"Rendering note {rendered_notes}/{total_notes}\u2026",
                     )
 
-    # Trim trailing silence
+    # Trim trailing silence (no extra tail pad for seamless loops)
     last_nonzero = np.flatnonzero(np.abs(buf) > 1e-6)
     if last_nonzero.size > 0:
-        tail_pad = min(sample_rate // 2, total_samples - last_nonzero[-1] - 1)
-        buf = buf[: last_nonzero[-1] + 1 + tail_pad]
+        buf = buf[: last_nonzero[-1] + 1]
     else:
         buf = buf[:sample_rate]  # 1 second of silence if nothing rendered
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -19,6 +20,7 @@ from PyQt6.QtWidgets import (
 )
 
 from daw.instruments import INSTRUMENT_LIBRARY
+from daw.generator import GENRE_NAMES
 from daw.shortcuts import (
     KeyBinding,
     ShortcutConfig,
@@ -156,6 +158,77 @@ class AudioToMusicDialog(QDialog):
 
     def auto_select_instruments(self) -> bool:
         return self.chk_auto_select_instruments.isChecked()
+
+
+class BeautifyDialog(QDialog):
+    """Ask the user whether to beautify the current track or all tracks."""
+
+    def __init__(self, current_track_name: str | None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("✨ Beautify Tracks")
+        self.resize(430, 260)
+
+        layout = QVBoxLayout(self)
+
+        title = QLabel("Apply music-theory beautification")
+        title.setStyleSheet("font-size: 15px; font-weight: 700;")
+        layout.addWidget(title)
+
+        desc = QLabel(
+            "Analyses each track's role (lead / bass / harmony / drums) "
+            "from its pitch range, instrument, and note patterns, then "
+            "applies role-appropriate music theory corrections."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #9a9a9a; font-size: 11px;")
+        layout.addWidget(desc)
+
+        self.radio_current = QRadioButton(
+            f"Current track only ({current_track_name})" if current_track_name
+            else "Current track only"
+        )
+        self.radio_all = QRadioButton("All tracks")
+        self.radio_current.setChecked(True)
+        if not current_track_name:
+            self.radio_current.setEnabled(False)
+            self.radio_all.setChecked(True)
+
+        self._target_group = QButtonGroup(self)
+        self._target_group.setExclusive(True)
+        self._target_group.addButton(self.radio_current)
+        self._target_group.addButton(self.radio_all)
+
+        layout.addWidget(self.radio_current)
+        layout.addWidget(self.radio_all)
+
+        mode_title = QLabel("Playback intent")
+        mode_title.setStyleSheet("font-size: 13px; font-weight: 600; margin-top: 6px;")
+        layout.addWidget(mode_title)
+
+        self.radio_standard = QRadioButton("🎬 Standard beautify (one-time playback)")
+        self.radio_loop = QRadioButton("🔁 Loop-aware beautify (preserve seamless restart)")
+        self.radio_standard.setChecked(True)
+
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+        self._mode_group.addButton(self.radio_standard)
+        self._mode_group.addButton(self.radio_loop)
+
+        layout.addWidget(self.radio_standard)
+        layout.addWidget(self.radio_loop)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def apply_to_all(self) -> bool:
+        return self.radio_all.isChecked()
+
+    def loop_aware(self) -> bool:
+        return self.radio_loop.isChecked()
 
 
 class RoleInstrumentDialog(QDialog):
@@ -572,3 +645,102 @@ class HelpDialog(QDialog):
             parts.append(key_to_text(binding.key))
 
         return " + ".join(parts) if parts else "None"
+
+class GenerateMusicDialog(QDialog):
+    """Modal dialog to select a genre/mood for procedural music generation."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("🎵 Generate Music")
+        self.resize(420, 480)
+
+        layout = QVBoxLayout(self)
+
+        title = QLabel("Choose a genre / mood")
+        title.setStyleSheet("font-size: 15px; font-weight: 700;")
+        layout.addWidget(title)
+
+        desc = QLabel(
+            "Select a genre and click Generate to create a full\n"
+            "multi-track song (Lead, Bass, Harmony, Drums)."
+        )
+        desc.setStyleSheet("color: #aaaaaa; font-size: 12px;")
+        layout.addWidget(desc)
+
+        self.list_widget = QListWidget()
+        _GENRE_ICONS = {
+            "Happy": "😊", "Calm": "🌿", "Sad": "😢",
+            "Horror": "👻", "Epic": "⚔️", "Action": "💥",
+            "Retro / Chiptune": "🕹️", "Mystery": "🔮",
+            "Boss Battle": "🐉",
+        }
+        for name in GENRE_NAMES:
+            icon = _GENRE_ICONS.get(name, "🎵")
+            item = QListWidgetItem(f"{icon}  {name}")
+            item.setData(Qt.ItemDataRole.UserRole, name)
+            self.list_widget.addItem(item)
+        self.list_widget.setCurrentRow(0)
+        self.list_widget.itemDoubleClicked.connect(lambda _: self.accept())
+        layout.addWidget(self.list_widget)
+
+        # ── Playback mode ─────────────────────────────────────────
+        mode_label = QLabel("Playback mode")
+        mode_label.setStyleSheet("font-size: 13px; font-weight: 600; margin-top: 6px;")
+        layout.addWidget(mode_label)
+
+        self.radio_loop = QRadioButton(
+            "🔁  Seamless loop  (8 bars — designed to repeat infinitely)"
+        )
+        self.radio_onetime = QRadioButton(
+            "🎬  One-time play  (longer piece, natural ending)"
+        )
+        self.radio_loop.setChecked(True)
+        layout.addWidget(self.radio_loop)
+        layout.addWidget(self.radio_onetime)
+
+        # ── Length selector ────────────────────────────────────────
+        length_row = QHBoxLayout()
+        length_lbl = QLabel("Length:")
+        length_lbl.setStyleSheet("font-size: 12px;")
+        self.combo_length = QComboBox()
+        self._loop_lengths = [
+            ("Short (8 bars)",  8),
+            ("Medium (16 bars)", 16),
+        ]
+        self._onetime_lengths = [
+            ("Medium (16 bars)", 16),
+            ("Long (32 bars)",   32),
+            ("Epic (48 bars)",   48),
+            ("Marathon (64 bars)", 64),
+        ]
+        self._update_length_choices()
+        self.radio_loop.toggled.connect(self._update_length_choices)
+        length_row.addWidget(length_lbl)
+        length_row.addWidget(self.combo_length, 1)
+        layout.addLayout(length_row)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Generate")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _update_length_choices(self):
+        self.combo_length.clear()
+        choices = self._loop_lengths if self.radio_loop.isChecked() else self._onetime_lengths
+        for label, value in choices:
+            self.combo_length.addItem(label, value)
+
+    def is_loop_mode(self) -> bool:
+        return self.radio_loop.isChecked()
+
+    def selected_bars(self) -> int:
+        return self.combo_length.currentData() or 8
+
+    def selected_genre(self) -> str | None:
+        item = self.list_widget.currentItem()
+        if item:
+            return item.data(Qt.ItemDataRole.UserRole)
+        return None

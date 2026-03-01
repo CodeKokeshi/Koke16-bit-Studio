@@ -286,14 +286,19 @@ def _consolidate_notes(
     """Clean up raw CQT note output to produce musically coherent results.
 
     Steps:
+    0. Stabilise rapid pitch oscillations (absorb jitter into neighbours).
     1. Remove very short notes (< 2 ticks) — these are click/noise artefacts.
     2. Merge same-pitch notes that overlap or are separated by ≤ 1 tick gap.
     3. Absorb ±1 semitone fragments into stronger neighbours (CQT bin leakage).
     4. Quantize note starts to the nearest half-beat grid.
     5. Re-merge after quantization (quantizing can create new overlaps).
+    6. Final cleanup — remove any remaining micro-notes after merging.
     """
     if not notes:
         return notes
+
+    # ── 0) Pitch stabilisation (absorb jitter / oscillations) ─────────
+    notes = _stabilize_pitch_sequence(notes, ticks_per_beat)
 
     # ── 1) Remove tiny fragments ──────────────────────────────────────
     notes = [n for n in notes if n.length_tick >= 2]
@@ -318,6 +323,14 @@ def _consolidate_notes(
 
     # ── 5) Merge again after quantization ─────────────────────────────
     notes = _merge_same_pitch(notes, max_gap=0)
+
+    # ── 6) Final cleanup — remove micro-notes that survived merging ───
+    if notes:
+        lengths = sorted(n.length_tick for n in notes)
+        med = float(lengths[len(lengths) // 2])
+        # Drop notes shorter than 25 % of the median (clearly artefacts)
+        cutoff = max(1, int(med * 0.25))
+        notes = [n for n in notes if n.length_tick >= cutoff]
 
     # Final sort
     notes.sort(key=lambda n: n.start_tick)
@@ -395,6 +408,110 @@ def _absorb_semitone_leakage(notes: list[NoteEvent]) -> list[NoteEvent]:
                 removed.add(j)
 
     return survivors
+
+
+# ---------------------------------------------------------------------------
+# Pitch stabilisation  (eliminate rapid jitter / oscillations)
+# ---------------------------------------------------------------------------
+
+def _stabilize_pitch_sequence(
+    notes: list[NoteEvent],
+    ticks_per_beat: int = 4,
+) -> list[NoteEvent]:
+    """Smooth out rapid pitch oscillations caused by transcription artefacts.
+
+    When a short note is sandwiched between longer notes of similar pitch,
+    it is almost certainly a pitch-detection wobble (vibrato, noise,
+    spectral leakage).  This function absorbs those short outliers into
+    their stronger neighbours, then re-merges same-pitch runs.
+
+    The algorithm applies music-theory reasoning:
+    * Notes shorter than a 16th-note equivalent are candidates for absorption.
+    * A candidate is absorbed if its pitch is within ±2 semitones of the
+      dominant pitch in its local time window.
+    * The dominant pitch is determined by duration-weighted voting among
+      the candidate's immediate neighbours.
+    * Multiple passes ensure cascading jitter is fully resolved.
+    """
+    if len(notes) < 3:
+        return notes
+
+    notes = sorted(notes, key=lambda n: n.start_tick)
+
+    # Minimum length to be considered "stable" (a 16th note)
+    min_stable = max(1, ticks_per_beat // 4) if ticks_per_beat >= 4 else 1
+
+    # Use median note length as the baseline — notes significantly shorter
+    # than this are suspicious.
+    lengths = sorted(n.length_tick for n in notes)
+    med_len = float(lengths[len(lengths) // 2])
+    short_threshold = max(min_stable, int(med_len * 0.4))
+
+    for _pass in range(3):
+        changed = False
+        stable_flags = [n.length_tick >= short_threshold for n in notes]
+
+        result: list[NoteEvent] = []
+        for i, note in enumerate(notes):
+            if stable_flags[i]:
+                result.append(NoteEvent(
+                    note.start_tick, note.length_tick,
+                    note.midi_note, note.velocity,
+                ))
+                continue
+
+            # Find nearest stable neighbours (left and right)
+            left: NoteEvent | None = None
+            right: NoteEvent | None = None
+            for j in range(i - 1, -1, -1):
+                if stable_flags[j]:
+                    left = notes[j]
+                    break
+            for j in range(i + 1, len(notes)):
+                if stable_flags[j]:
+                    right = notes[j]
+                    break
+
+            # Determine dominant pitch from neighbours
+            target_pitch: int | None = None
+            if left and right:
+                if left.midi_note == right.midi_note:
+                    # Sandwiched between same pitch — clearly an artefact
+                    target_pitch = left.midi_note
+                elif abs(note.midi_note - left.midi_note) <= 2:
+                    # Closer to left neighbour
+                    target_pitch = left.midi_note
+                elif abs(note.midi_note - right.midi_note) <= 2:
+                    target_pitch = right.midi_note
+                else:
+                    # Pick the one with more "weight" (duration × velocity)
+                    l_w = left.length_tick * left.velocity
+                    r_w = right.length_tick * right.velocity
+                    cand = left if l_w >= r_w else right
+                    if abs(note.midi_note - cand.midi_note) <= 3:
+                        target_pitch = cand.midi_note
+            elif left and abs(note.midi_note - left.midi_note) <= 2:
+                target_pitch = left.midi_note
+            elif right and abs(note.midi_note - right.midi_note) <= 2:
+                target_pitch = right.midi_note
+
+            if target_pitch is not None and target_pitch != note.midi_note:
+                changed = True
+
+            result.append(NoteEvent(
+                note.start_tick,
+                note.length_tick,
+                target_pitch if target_pitch is not None else note.midi_note,
+                note.velocity,
+            ))
+
+        notes = result
+        if not changed:
+            break
+
+    # After snapping pitches, merge same-pitch neighbours that now abut
+    notes = _merge_same_pitch(notes, max_gap=1)
+    return notes
 
 
 # ---------------------------------------------------------------------------
@@ -493,9 +610,10 @@ def audio_to_note_events(
     start_f = 0
     cum_prob = 0.0
     cnt = 0
+    _pitch_votes: list[int] = []
 
     def _flush(end_f: int) -> None:
-        nonlocal cur, cum_prob, cnt
+        nonlocal cur, cum_prob, cnt, _pitch_votes
         if cur is None or cnt == 0:
             return
         ef = min(end_f, n_frames - 1)
@@ -514,6 +632,7 @@ def audio_to_note_events(
         cur = None
         cum_prob = 0.0
         cnt = 0
+        _pitch_votes = []
 
     for i in range(n_frames):
         voiced = (
@@ -525,15 +644,30 @@ def audio_to_note_events(
             mv = max(21, min(108, int(round(float(midi_raw[i])))))
             if cur is None:
                 cur, start_f, cum_prob, cnt = mv, i, float(voiced_prob[i]), 1
-            elif abs(mv - cur) <= 1:
+                _pitch_votes = [mv]
+            elif abs(mv - cur) <= 2:
                 cum_prob += float(voiced_prob[i])
                 cnt += 1
+                _pitch_votes.append(mv)
             else:
+                # Use the most-voted pitch for this region (mode) instead
+                # of the first detected pitch — reduces jitter.
+                if _pitch_votes:
+                    from collections import Counter as _C
+                    cur = _C(_pitch_votes).most_common(1)[0][0]
                 _flush(i)
                 cur, start_f, cum_prob, cnt = mv, i, float(voiced_prob[i]), 1
+                _pitch_votes = [mv]
         else:
+            if cur is not None and _pitch_votes:
+                from collections import Counter as _C
+                cur = _C(_pitch_votes).most_common(1)[0][0]
             _flush(i)
 
+    # Final flush – resolve pitch from votes
+    if cur is not None and _pitch_votes:
+        from collections import Counter as _C
+        cur = _C(_pitch_votes).most_common(1)[0][0]
     _flush(n_frames - 1)
 
     # merge same-pitch neighbours
@@ -550,6 +684,13 @@ def audio_to_note_events(
                 prev.velocity = (prev.velocity + note.velocity) // 2
                 continue
         merged.append(note)
+
+    # Stabilise jitter and apply theory cleaning (same as multitrack path)
+    merged = _stabilize_pitch_sequence(merged, ticks_per_beat)
+    merged = _merge_same_pitch(merged, max_gap=1)
+    fixer = SmartTheoryFixer(strictness=0.75)
+    merged = fixer.fix(merged, role="lead")
+
     return merged
 
 
@@ -643,7 +784,7 @@ def audio_to_multitrack_events(
         C, max_mag, _MIDI_LO, frame_times,
         duration_s, total_ticks,
         global_thresh, frame_thresh,
-        max_gap=5, min_frames=3,
+        max_gap=2, min_frames=2,
     )
 
     # ── consolidate notes (remove noise, merge fragments, quantize) ───
@@ -677,7 +818,7 @@ def audio_to_multitrack_events(
         "harmony": harmony_events,
         "drums":   drums_events,
     }
-    fixer = SmartTheoryFixer(strictness=0.65)
+    fixer = SmartTheoryFixer(strictness=0.75)
     clean_split = fixer.fix_multitrack(raw_split)
 
     _report(100, "Analysis complete.")
