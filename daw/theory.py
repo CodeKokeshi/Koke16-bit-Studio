@@ -449,20 +449,27 @@ class SmartTheoryFixer:
                 note.midi_note = best
 
         # 3) Remove rapid repeated notes (bass should be sparse)
+        #    Only merge truly overlapping same-pitch notes with similar velocity.
+        #    Preserve intentional re-articulations (different velocity or adjacent).
         cleaned: list[NoteEvent] = []
         for note in notes:
             if cleaned:
                 prev = cleaned[-1]
                 prev_end = prev.start_tick + prev.length_tick
                 if (note.midi_note == prev.midi_note
-                        and note.start_tick - prev_end <= 1):
-                    # Merge into previous
-                    prev.length_tick = max(
-                        prev.length_tick,
-                        note.start_tick + note.length_tick - prev.start_tick,
-                    )
-                    prev.velocity = max(prev.velocity, note.velocity)
-                    continue
+                        and note.start_tick < prev_end):
+                    vel_diff = abs(prev.velocity - note.velocity)
+                    if vel_diff <= 10:
+                        # Likely duplicate; merge
+                        prev.length_tick = max(
+                            prev.length_tick,
+                            note.start_tick + note.length_tick - prev.start_tick,
+                        )
+                        prev.velocity = max(prev.velocity, note.velocity)
+                        continue
+                    else:
+                        # Re-articulation; trim first note
+                        prev.length_tick = max(1, note.start_tick - prev.start_tick)
             cleaned.append(note)
 
         return cleaned
@@ -729,7 +736,14 @@ class SmartTheoryFixer:
         return cleaned
 
     def _remove_overlaps(self, notes: list[NoteEvent]) -> list[NoteEvent]:
-        """Merge or trim notes with the same pitch that overlap in time."""
+        """Resolve same-pitch overlaps while preserving intentional re-articulations.
+
+        Only truly overlapping notes (second starts *inside* the first) are
+        touched.  Even then, if the velocities differ significantly the first
+        note is *trimmed* rather than merged so the re-attack is kept.
+        Adjacent notes (second starts at or after the first ends) are never
+        merged — they represent intentional separate hits.
+        """
         if len(notes) < 2:
             return notes
 
@@ -740,12 +754,18 @@ class SmartTheoryFixer:
             if cleaned and cleaned[-1].midi_note == note.midi_note:
                 prev = cleaned[-1]
                 prev_end = prev.start_tick + prev.length_tick
-                # Overlapping or adjacent → merge
-                if note.start_tick <= prev_end + 1:
-                    new_end = max(prev_end, note.start_tick + note.length_tick)
-                    prev.length_tick = new_end - prev.start_tick
-                    prev.velocity = max(prev.velocity, note.velocity)
-                    continue
+                # Only act on genuine overlaps (second note starts inside the first)
+                if note.start_tick < prev_end:
+                    vel_diff = abs(prev.velocity - note.velocity)
+                    if vel_diff <= 10:
+                        # Nearly identical velocity → likely a duplicate; merge
+                        new_end = max(prev_end, note.start_tick + note.length_tick)
+                        prev.length_tick = new_end - prev.start_tick
+                        prev.velocity = max(prev.velocity, note.velocity)
+                        continue
+                    else:
+                        # Different velocity → intentional re-articulation; trim first note
+                        prev.length_tick = max(1, note.start_tick - prev.start_tick)
             cleaned.append(note)
 
         # Re-sort by time for downstream consumers

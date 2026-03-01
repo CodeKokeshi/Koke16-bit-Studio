@@ -44,6 +44,7 @@ from daw.project_io import ProjectFormatError, load_kokestudio_file, save_kokest
 from daw.transcriber import audio_to_multitrack_events, load_audio, TranscriptionCancelled
 from daw.instruments import INSTRUMENT_LIBRARY
 from daw.theory import SmartTheoryFixer, detect_track_role, remove_gaps, balance_tracks, fix_loops
+from daw.undo import ProjectUndoManager
 
 
 APP_QSS = """
@@ -316,6 +317,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.project = Project()
         self.audio = AudioEngine(self.project)
+        self._undo_mgr = ProjectUndoManager(max_depth=40)
 
         self.setWindowTitle("Koke16-Bit Studio")
         self.resize(1400, 860)
@@ -403,6 +405,14 @@ class MainWindow(QMainWindow):
         self.btn_save_project = QPushButton("💾 Save Project")
         self.btn_export = QPushButton("💾 Export WAV")
 
+        # File toolbar tooltips
+        self.btn_hum_music.setToolTip("Record from microphone and convert to retro music")
+        self.btn_open_recent.setToolTip("Browse recently opened projects")
+        self.btn_import_music.setToolTip("Import a WAV file and convert to multi-track chiptune")
+        self.btn_load_project.setToolTip("Open a .kokestudio project file (Ctrl+O)")
+        self.btn_save_project.setToolTip("Save the current project (Ctrl+S)")
+        self.btn_export.setToolTip("Export all tracks as a WAV file (Ctrl+E)")
+
         file_toolbar_layout.addWidget(self.btn_open_recent)
         file_toolbar_layout.addWidget(self.btn_load_project)
         file_toolbar_layout.addWidget(self.btn_save_project)
@@ -416,6 +426,8 @@ class MainWindow(QMainWindow):
         studio_toolbar_layout.setSpacing(8)
 
         self.btn_add_track = QPushButton("+ Add Piano Roll Track")
+        self.btn_undo = QPushButton("↩ Undo")
+        self.btn_redo = QPushButton("↪ Redo")
         self.btn_play_all = QPushButton("▶ Play All Tracks")
         self.btn_play_this = QPushButton("▷ Play This Track")
         self.btn_stop = QPushButton("■ Stop")
@@ -424,7 +436,26 @@ class MainWindow(QMainWindow):
         self.btn_balance = QPushButton("⚖ Balance")
         self.btn_fix_loops = QPushButton("🔁 Fix Loops")
         self.btn_generate = QPushButton("🎵 Generate")
+
+        self.btn_undo.setEnabled(False)
+        self.btn_redo.setEnabled(False)
+        self.btn_undo.setToolTip("Undo last project change (Ctrl+Z)")
+        self.btn_redo.setToolTip("Redo (Ctrl+Y / Ctrl+Shift+Z)")
+
+        # Tooltips for all toolbar buttons
+        self.btn_add_track.setToolTip("Add a new piano roll track")
+        self.btn_play_all.setToolTip("Play all tracks together (Space to toggle)")
+        self.btn_play_this.setToolTip("Solo-play the selected track")
+        self.btn_stop.setToolTip("Stop playback")
+        self.btn_beautify.setToolTip("Apply music-theory beautification to notes")
+        self.btn_remove_gaps.setToolTip("Collapse dead space between notes")
+        self.btn_balance.setToolTip("Extend shorter tracks to match the longest")
+        self.btn_fix_loops.setToolTip("Smooth end→start transitions for seamless looping")
+        self.btn_generate.setToolTip("Auto-generate multi-track retro music")
+
         studio_toolbar_layout.addWidget(self.btn_add_track)
+        studio_toolbar_layout.addWidget(self.btn_undo)
+        studio_toolbar_layout.addWidget(self.btn_redo)
         studio_toolbar_layout.addWidget(self.btn_play_all)
         studio_toolbar_layout.addWidget(self.btn_play_this)
         studio_toolbar_layout.addWidget(self.btn_stop)
@@ -516,6 +547,10 @@ class MainWindow(QMainWindow):
             "  ＋  Add Piano Roll Track → compose from scratch\n"
             "  🎙  Hum → Music → sing into your mic\n"
             "  📁  Import Audio → convert a WAV file\n\n"
+            "Shortcuts:\n"
+            "  Ctrl+Z / Ctrl+Y  Undo / Redo project changes\n"
+            "  Ctrl+S  Save   ·   Ctrl+O  Open   ·   Ctrl+E  Export\n"
+            "  Delete  Remove selected tracks\n\n"
             "Tip: Use Ctrl+Click to multi-select tracks in the left panel."
         )
         self.empty_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -571,7 +606,13 @@ class MainWindow(QMainWindow):
             "- Drag note body: move\n"
             "- Drag note right edge: resize\n"
             "- Right click note: delete\n"
-            "- Click note keys (left): preview pitch"
+            "- Click note keys (left): preview pitch\n"
+            "- Ctrl+A: select all notes\n\n"
+            "Global Shortcuts:\n"
+            "- Ctrl+Z / Ctrl+Y: Undo / Redo\n"
+            "- Ctrl+S: Save  ·  Ctrl+O: Open\n"
+            "- Ctrl+E: Export WAV\n"
+            "- Del: Delete selected track(s)"
         )
         tips.setStyleSheet("color:#7a7a7a; font-size:11px;")
         tips.setWordWrap(True)
@@ -593,6 +634,8 @@ class MainWindow(QMainWindow):
         self.btn_help.clicked.connect(self._open_help)
 
         self.btn_add_track.clicked.connect(self._on_add_track)
+        self.btn_undo.clicked.connect(self._project_undo)
+        self.btn_redo.clicked.connect(self._project_redo)
         self.btn_open_recent.clicked.connect(self._on_open_recent_page)
         self.btn_hum_music.clicked.connect(self._on_hum_music)
         self.btn_load_project.clicked.connect(self._on_load_project)
@@ -614,6 +657,8 @@ class MainWindow(QMainWindow):
         self.list_tracks.currentRowChanged.connect(self._on_track_selected)
         self.list_tracks.customContextMenuRequested.connect(self._on_tracks_context_menu)
         self.track_volume.valueChanged.connect(self._on_track_volume_changed)
+        self.track_volume.sliderPressed.connect(self._on_volume_drag_start)
+        self.track_volume.sliderReleased.connect(self._on_volume_drag_end)
 
         self.editor.note_selected.connect(self._on_note_selected)
         self.editor.note_audition.connect(self._on_note_audition)
@@ -644,6 +689,148 @@ class MainWindow(QMainWindow):
         dialog = HelpDialog(self.editor.shortcut_config(), self)
         dialog.setModal(True)
         dialog.exec()
+
+    # ── Project-level undo / redo ──────────────────────────────────
+
+    def _push_project_undo(self, label: str) -> None:
+        """Snapshot the entire project state BEFORE a destructive op."""
+        self._undo_mgr.snapshot(self.project, label)
+        self._update_undo_status()
+
+    def _project_undo(self) -> None:
+        label = self._undo_mgr.undo(self.project)
+        if label is None:
+            self.status.showMessage("Nothing to undo.", 1500)
+            return
+        self._after_project_restore(f"Undo: {label}")
+
+    def _project_redo(self) -> None:
+        label = self._undo_mgr.redo(self.project)
+        if label is None:
+            self.status.showMessage("Nothing to redo.", 1500)
+            return
+        self._after_project_restore(f"Redo: {label}")
+
+    def _after_project_restore(self, message: str) -> None:
+        """Refresh every UI element after an undo/redo restore."""
+        self.audio.project = self.project
+        self.audio._cache.clear()
+
+        # BPM / loop UI
+        self.spin_bpm.blockSignals(True)
+        self.spin_bpm.setValue(self.project.bpm)
+        self.spin_bpm.blockSignals(False)
+
+        mode_index = {"dynamic": 0, "timeline": 1, "custom": 2}.get(self.project.loop_mode, 0)
+        self.combo_loop_mode.blockSignals(True)
+        self.combo_loop_mode.setCurrentIndex(mode_index)
+        self.combo_loop_mode.blockSignals(False)
+        self.spin_loop_beats.setEnabled(self.project.loop_mode == "custom")
+
+        bars = max(1, int(self.project.custom_loop_ticks / (self.project.ticks_per_beat * 4)))
+        self.spin_loop_beats.blockSignals(True)
+        self.spin_loop_beats.setValue(bars)
+        self.spin_loop_beats.blockSignals(False)
+
+        # Track list + editor
+        self._refresh_track_list()
+        idx = self.project.selected_track_index
+        if 0 <= idx < len(self.project.tracks):
+            self.list_tracks.setCurrentRow(idx)
+        else:
+            self.list_tracks.setCurrentRow(-1)
+
+        self._update_undo_status()
+        self.status.showMessage(message, 2500)
+
+    def _update_undo_status(self) -> None:
+        """Update the undo/redo button enabled state + tooltips."""
+        if hasattr(self, "btn_undo"):
+            self.btn_undo.setEnabled(self._undo_mgr.can_undo)
+            tip = f"Undo: {self._undo_mgr.undo_label}" if self._undo_mgr.can_undo else "Nothing to undo"
+            self.btn_undo.setToolTip(tip)
+        if hasattr(self, "btn_redo"):
+            self.btn_redo.setEnabled(self._undo_mgr.can_redo)
+            tip = f"Redo: {self._undo_mgr.redo_label}" if self._undo_mgr.can_redo else "Nothing to redo"
+            self.btn_redo.setToolTip(tip)
+
+    def keyPressEvent(self, event):
+        """Global Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z dispatch.
+
+        If the piano roll canvas has focus, let it handle its own local
+        undo/redo.  Otherwise, perform project-level undo/redo.
+        """
+        mods = event.modifiers()
+        key = event.key()
+
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+
+        # Let piano roll handle its own undo when it has focus
+        canvas_focused = self.editor.canvas.hasFocus() if hasattr(self.editor, "canvas") else False
+
+        if ctrl and not shift and key == Qt.Key.Key_Z:
+            if canvas_focused:
+                self.editor.canvas.undo()
+            else:
+                self._project_undo()
+            return
+
+        if ctrl and key == Qt.Key.Key_Y:
+            if canvas_focused:
+                self.editor.canvas.redo()
+            else:
+                self._project_redo()
+            return
+
+        if ctrl and shift and key == Qt.Key.Key_Z:
+            if canvas_focused:
+                self.editor.canvas.redo()
+            else:
+                self._project_redo()
+            return
+
+        # Ctrl+S → Save
+        if ctrl and not shift and key == Qt.Key.Key_S:
+            self._on_save_project()
+            return
+
+        # Ctrl+E → Export
+        if ctrl and not shift and key == Qt.Key.Key_E:
+            self._on_export_wav()
+            return
+
+        # Ctrl+O → Load
+        if ctrl and not shift and key == Qt.Key.Key_O:
+            self._on_load_project()
+            return
+
+        # Delete key → delete selected tracks (when track list focused)
+        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            if self.list_tracks.hasFocus() and self._get_selected_track_rows():
+                self._on_delete_selected_tracks()
+                return
+
+        # Space bar → play/stop toggle (only when not typing in a SpinBox etc.)
+        if key == Qt.Key.Key_Space and not ctrl and not shift:
+            focus = QApplication.focusWidget()
+            # Avoid triggering when focus is in a text-input widget
+            if not isinstance(focus, (QSpinBox, QComboBox)):
+                if self.audio.playing:
+                    self._on_stop()
+                else:
+                    self._on_play_all()
+                return
+
+        super().keyPressEvent(event)
+
+    def _update_window_title(self) -> None:
+        base = "Koke16-Bit Studio"
+        if self._project_file_path:
+            name = os.path.basename(self._project_file_path)
+            self.setWindowTitle(f"{name} — {base}")
+        else:
+            self.setWindowTitle(base)
 
     def _collect_session_state(self) -> dict:
         return {
@@ -726,6 +913,8 @@ class MainWindow(QMainWindow):
         if self.audio.playing:
             self.audio.stop()
 
+        self._undo_mgr.clear()
+
         self.project = loaded["project"]
         self.audio.project = self.project
 
@@ -764,6 +953,7 @@ class MainWindow(QMainWindow):
             self._apply_loaded_state(loaded)
             self._project_file_path = path
             self._push_recent_project(path)
+            self._update_window_title()
             self.status.showMessage(f"Project loaded: {path}", 3500)
         except ProjectFormatError as exc:
             QMessageBox.warning(self, "Load Failed", f"Invalid project file:\n{exc}")
@@ -790,6 +980,7 @@ class MainWindow(QMainWindow):
             )
             self._project_file_path = path
             self._push_recent_project(path)
+            self._update_window_title()
             self.status.showMessage(f"Project saved: {path}", 3000)
         except Exception as exc:
             QMessageBox.warning(self, "Save Failed", f"Could not save project:\n{exc}")
@@ -811,6 +1002,7 @@ class MainWindow(QMainWindow):
             selected = dialog.selected_instrument()
             if not selected:
                 return
+            self._push_project_undo("Add Track")
             index = len(self.project.tracks) + 1
             name = f"{selected['name']} {index}"
             track = Track(name=name, instrument_name=selected["name"], waveform=selected["waveform"], volume=0.8)
@@ -1046,6 +1238,8 @@ class MainWindow(QMainWindow):
             self.status.showMessage("No clear parts detected for auto-retrofy.", 3000)
             return
 
+        self._push_project_undo("Import Audio")
+
         # Offer to clear existing tracks before importing
         if self.project.tracks:
             clear_answer = QMessageBox.question(
@@ -1145,6 +1339,8 @@ class MainWindow(QMainWindow):
             else:
                 self.center_tabs.setCurrentWidget(self.center_stack)
 
+        self._update_undo_status()
+
     def _on_track_selected(self, row: int):
         if row < 0 or row >= len(self.project.tracks):
             self.project.selected_track_index = -1
@@ -1174,6 +1370,14 @@ class MainWindow(QMainWindow):
                 self.project.tracks[r].volume = value / 100.0
         elif self.project.selected_track:
             self.project.selected_track.volume = value / 100.0
+
+    def _on_volume_drag_start(self):
+        """Snapshot before a slider drag so the whole drag is one undo step."""
+        self._push_project_undo("Volume Change")
+
+    def _on_volume_drag_end(self):
+        """Volume drag finished — undo state was already captured on press."""
+        self._update_undo_status()
 
     def _on_note_selected(self, note_obj):
         self._active_note = note_obj
@@ -1288,6 +1492,8 @@ class MainWindow(QMainWindow):
         if dlg.exec() != dlg.DialogCode.Accepted:
             return
 
+        self._push_project_undo("Beautify")
+
         apply_all = dlg.apply_to_all()
         loop_aware = dlg.loop_aware()
 
@@ -1392,6 +1598,7 @@ class MainWindow(QMainWindow):
         if not ok:
             return
 
+        self._push_project_undo("Remove Gaps")
         apply_all = "All" in choice
 
         if apply_all:
@@ -1450,6 +1657,7 @@ class MainWindow(QMainWindow):
             )
             return
 
+        self._push_project_undo("Balance")
         try:
             # Gather all note lists
             all_notes = [t.notes for t in self.project.tracks]
@@ -1512,6 +1720,7 @@ class MainWindow(QMainWindow):
             )
             return
 
+        self._push_project_undo("Fix Loops")
         try:
             all_notes = [t.notes for t in self.project.tracks]
             fixed = fix_loops(all_notes, self.project.ticks_per_beat)
@@ -1574,6 +1783,8 @@ class MainWindow(QMainWindow):
             genre = dialog.selected_genre()
             if not genre:
                 return
+
+            self._push_project_undo("Generate Music")
 
             # Offer to clear existing tracks
             if self.project.tracks:
@@ -1712,6 +1923,8 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
 
+        self._push_project_undo("Delete Track(s)")
+
         if self.audio.playing:
             self.audio.stop()
 
@@ -1757,6 +1970,7 @@ class MainWindow(QMainWindow):
 
         selected_index = labels.index(choice)
         selected = INSTRUMENT_LIBRARY[selected_index]
+        self._push_project_undo("Change Instrument")
         track.instrument_name = selected["name"]
         track.waveform = selected["waveform"]
 
