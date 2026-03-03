@@ -372,11 +372,14 @@ class MainWindow(QMainWindow):
         self.btn_tab_file.setCheckable(True)
         self.btn_tab_studio = QPushButton("Studio")
         self.btn_tab_studio.setCheckable(True)
+        self.btn_tab_magic = QPushButton("Magic")
+        self.btn_tab_magic.setCheckable(True)
         self.btn_settings = QPushButton("Settings")
         self.btn_help = QPushButton("Help")
 
         top_row.addWidget(self.btn_tab_file)
         top_row.addWidget(self.btn_tab_studio)
+        top_row.addWidget(self.btn_tab_magic)
         top_row.addWidget(self.btn_settings)
         top_row.addWidget(self.btn_help)
 
@@ -398,12 +401,12 @@ class MainWindow(QMainWindow):
         file_toolbar_layout.setContentsMargins(0, 0, 0, 0)
         file_toolbar_layout.setSpacing(8)
 
-        self.btn_hum_music = QPushButton("🎙 Hum → Music")
-        self.btn_open_recent = QPushButton("🕘 Open Recent")
-        self.btn_import_music = QPushButton("📁 Import Audio → Music")
-        self.btn_load_project = QPushButton("📂 Load Project")
-        self.btn_save_project = QPushButton("💾 Save Project")
-        self.btn_export = QPushButton("💾 Export WAV")
+        self.btn_hum_music = QPushButton("Hum → Music")
+        self.btn_open_recent = QPushButton("Open Recent")
+        self.btn_import_music = QPushButton("Import Audio → Music")
+        self.btn_load_project = QPushButton("Load Project")
+        self.btn_save_project = QPushButton("Save Project")
+        self.btn_export = QPushButton("Export WAV")
 
         # File toolbar tooltips
         self.btn_hum_music.setToolTip("Record from microphone and convert to retro music")
@@ -412,12 +415,15 @@ class MainWindow(QMainWindow):
         self.btn_load_project.setToolTip("Open a .kokestudio project file (Ctrl+O)")
         self.btn_save_project.setToolTip("Save the current project (Ctrl+S)")
         self.btn_export.setToolTip("Export all tracks as a WAV file (Ctrl+E)")
+        self.btn_generate = QPushButton("Generate")
+        self.btn_generate.setToolTip("Auto-generate multi-track retro music")
 
         file_toolbar_layout.addWidget(self.btn_open_recent)
         file_toolbar_layout.addWidget(self.btn_load_project)
         file_toolbar_layout.addWidget(self.btn_save_project)
         file_toolbar_layout.addWidget(self.btn_import_music)
         file_toolbar_layout.addWidget(self.btn_hum_music)
+        file_toolbar_layout.addWidget(self.btn_generate)
         file_toolbar_layout.addWidget(self.btn_export)
 
         studio_toolbar = QWidget()
@@ -431,11 +437,6 @@ class MainWindow(QMainWindow):
         self.btn_play_all = QPushButton("▶ Play All Tracks")
         self.btn_play_this = QPushButton("▷ Play This Track")
         self.btn_stop = QPushButton("■ Stop")
-        self.btn_beautify = QPushButton("✨ Beautify")
-        self.btn_remove_gaps = QPushButton("⊟ Remove Gaps")
-        self.btn_balance = QPushButton("⚖ Balance")
-        self.btn_fix_loops = QPushButton("🔁 Fix Loops")
-        self.btn_generate = QPushButton("🎵 Generate")
 
         self.btn_undo.setEnabled(False)
         self.btn_redo.setEnabled(False)
@@ -447,11 +448,6 @@ class MainWindow(QMainWindow):
         self.btn_play_all.setToolTip("Play all tracks together (Space to toggle)")
         self.btn_play_this.setToolTip("Solo-play the selected track")
         self.btn_stop.setToolTip("Stop playback")
-        self.btn_beautify.setToolTip("Apply music-theory beautification to notes")
-        self.btn_remove_gaps.setToolTip("Collapse dead space between notes")
-        self.btn_balance.setToolTip("Extend shorter tracks to match the longest")
-        self.btn_fix_loops.setToolTip("Smooth end→start transitions for seamless looping")
-        self.btn_generate.setToolTip("Auto-generate multi-track retro music")
 
         studio_toolbar_layout.addWidget(self.btn_add_track)
         studio_toolbar_layout.addWidget(self.btn_undo)
@@ -459,11 +455,6 @@ class MainWindow(QMainWindow):
         studio_toolbar_layout.addWidget(self.btn_play_all)
         studio_toolbar_layout.addWidget(self.btn_play_this)
         studio_toolbar_layout.addWidget(self.btn_stop)
-        studio_toolbar_layout.addWidget(self.btn_beautify)
-        studio_toolbar_layout.addWidget(self.btn_remove_gaps)
-        studio_toolbar_layout.addWidget(self.btn_balance)
-        studio_toolbar_layout.addWidget(self.btn_fix_loops)
-        studio_toolbar_layout.addWidget(self.btn_generate)
 
         bpm_label = QLabel("BPM")
         self.spin_bpm = QSpinBox()
@@ -494,8 +485,29 @@ class MainWindow(QMainWindow):
         studio_toolbar_layout.addWidget(QLabel("Bars"))
         studio_toolbar_layout.addWidget(self.spin_loop_beats)
 
+        magic_toolbar = QWidget()
+        magic_toolbar_layout = QHBoxLayout(magic_toolbar)
+        magic_toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        magic_toolbar_layout.setSpacing(8)
+
+        self.btn_beautify = QPushButton("Beautify")
+        self.btn_remove_gaps = QPushButton("⊟ Remove Gaps")
+        self.btn_balance = QPushButton("Balance")
+        self.btn_fix_loops = QPushButton("Fix Loops")
+
+        self.btn_beautify.setToolTip("Apply music-theory beautification to notes")
+        self.btn_remove_gaps.setToolTip("Collapse dead space between notes")
+        self.btn_balance.setToolTip("Extend shorter tracks to match the longest")
+        self.btn_fix_loops.setToolTip("Smooth end→start transitions for seamless looping")
+
+        magic_toolbar_layout.addWidget(self.btn_beautify)
+        magic_toolbar_layout.addWidget(self.btn_remove_gaps)
+        magic_toolbar_layout.addWidget(self.btn_balance)
+        magic_toolbar_layout.addWidget(self.btn_fix_loops)
+
         self.toolbar_stack.addWidget(file_toolbar)
         self.toolbar_stack.addWidget(studio_toolbar)
+        self.toolbar_stack.addWidget(magic_toolbar)
         self._set_toolbar_mode("studio")
 
         main.addWidget(header)
@@ -630,6 +642,7 @@ class MainWindow(QMainWindow):
     def _wire_signals(self):
         self.btn_tab_file.clicked.connect(lambda: self._set_toolbar_mode("file"))
         self.btn_tab_studio.clicked.connect(lambda: self._set_toolbar_mode("studio"))
+        self.btn_tab_magic.clicked.connect(lambda: self._set_toolbar_mode("magic"))
         self.btn_settings.clicked.connect(self._open_settings)
         self.btn_help.clicked.connect(self._open_help)
 
@@ -674,9 +687,13 @@ class MainWindow(QMainWindow):
 
     def _set_toolbar_mode(self, mode: str):
         is_file = mode == "file"
+        is_studio = mode == "studio"
+        is_magic = mode == "magic"
         self.btn_tab_file.setChecked(is_file)
-        self.btn_tab_studio.setChecked(not is_file)
-        self.toolbar_stack.setCurrentIndex(0 if is_file else 1)
+        self.btn_tab_studio.setChecked(is_studio)
+        self.btn_tab_magic.setChecked(is_magic)
+        mode_to_index = {"file": 0, "studio": 1, "magic": 2}
+        self.toolbar_stack.setCurrentIndex(mode_to_index.get(mode, 1))
 
     def _open_settings(self):
         dialog = ShortcutSettingsDialog(self.editor.shortcut_config(), self)
@@ -1021,7 +1038,7 @@ class MainWindow(QMainWindow):
     def _start_hum_capture(self):
         self._hum_chunks = []
         self._hum_recording = True
-        self.btn_hum_music.setText("⏹ Stop Hum")
+        self.btn_hum_music.setText("Stop Hum")
         self.btn_hum_music.setStyleSheet("border-color: #ff4444; color: #ff4444;")
         self.waveform_widget.set_active(True)
         self.status.showMessage("🎙 Recording – hum/sing into your mic. Click Stop Hum when done.")
@@ -1047,7 +1064,7 @@ class MainWindow(QMainWindow):
         except Exception:
             self._hum_recording = False
             self._hum_stream = None
-            self.btn_hum_music.setText("🎙 Hum → Music")
+            self.btn_hum_music.setText("Hum → Music")
             self.btn_hum_music.setStyleSheet("")
             self.waveform_widget.set_active(False)
             self.status.showMessage("⚠ Microphone unavailable – check your audio device.", 4000)
@@ -1059,7 +1076,7 @@ class MainWindow(QMainWindow):
 
     def _stop_hum_capture_and_process(self):
         self._hum_recording = False
-        self.btn_hum_music.setText("🎙 Hum → Music")
+        self.btn_hum_music.setText("Hum → Music")
         self.btn_hum_music.setStyleSheet("")
         if hasattr(self, "_hum_display_timer"):
             self._hum_display_timer.stop()

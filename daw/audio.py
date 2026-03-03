@@ -21,7 +21,8 @@ class AudioEngine(QObject):
         self.playing = False
         self._solo_track_index: int | None = None
         self._start_tick: int | None = None
-        self._cache: dict[tuple[str, int, int], object] = {}
+        self._loop_cycle_index = 0
+        self._cache: dict[tuple[str, int, int, int, int], object] = {}
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -48,6 +49,7 @@ class AudioEngine(QObject):
         self._start_tick = start_tick
         loop_start, loop_end = self._loop_window()
         self.playing = True
+        self._loop_cycle_index = 0
         self.current_tick = self._resolve_start_tick(loop_start, loop_end)
         self.position_changed.emit(self.current_tick)
         self._timer.start(self._tick_ms())
@@ -82,14 +84,30 @@ class AudioEngine(QObject):
                 if note.start_tick == self.current_tick:
                     dur = max(0.04, note.length_tick / self.project.ticks_per_beat * 60.0 / self.project.bpm)
                     vel_amp = max(0.05, min(1.0, note.velocity / 127.0))
-                    sound = self._get_sound(track.waveform, note.midi_note, dur)
+                    note_end_tick = note.start_tick + note.length_tick
+                    apply_attack = not (
+                        note.start_tick == loop_start
+                        and self._loop_cycle_index > 0
+                    )
+                    apply_release = not (note_end_tick >= loop_end)
+                    sound = self._get_sound(
+                        track.waveform,
+                        note.midi_note,
+                        dur,
+                        apply_attack=apply_attack,
+                        apply_release=apply_release,
+                    )
                     ch = pygame.mixer.find_channel(True)
                     if ch is not None:
                         ch.set_volume(vel_amp * track.volume)
                         ch.play(sound)  # type: ignore[arg-type]
 
         next_tick = self.current_tick + 1
-        self.current_tick = loop_start if next_tick >= loop_end else next_tick
+        if next_tick >= loop_end:
+            self.current_tick = loop_start
+            self._loop_cycle_index += 1
+        else:
+            self.current_tick = next_tick
         self.position_changed.emit(self.current_tick)
 
     def _dynamic_loop_window(self) -> tuple[int, int]:
@@ -133,14 +151,42 @@ class AudioEngine(QObject):
             return [self.project.tracks[self._solo_track_index]]
         return []
 
-    def _get_sound(self, waveform: str, midi_note: int, duration: float):
+    def _get_sound(
+        self,
+        waveform: str,
+        midi_note: int,
+        duration: float,
+        apply_attack: bool = True,
+        apply_release: bool = True,
+    ):
         """Return a cached Sound at full volume (volume applied via channel)."""
-        key = (waveform, midi_note, int(duration * 1000))
+        key = (
+            waveform,
+            midi_note,
+            int(duration * 1000),
+            int(apply_attack),
+            int(apply_release),
+        )
         if key not in self._cache:
-            self._cache[key] = self._build_sound(waveform, midi_note, duration, amp=1.0)
+            self._cache[key] = self._build_sound(
+                waveform,
+                midi_note,
+                duration,
+                amp=1.0,
+                apply_attack=apply_attack,
+                apply_release=apply_release,
+            )
         return self._cache[key]
 
-    def _build_sound(self, waveform: str, midi_note: int, duration: float, amp: float):
+    def _build_sound(
+        self,
+        waveform: str,
+        midi_note: int,
+        duration: float,
+        amp: float,
+        apply_attack: bool = True,
+        apply_release: bool = True,
+    ):
         n_samples = max(1, int(self.sample_rate * duration))
         t = np.arange(n_samples, dtype=np.float32) / self.sample_rate
         freq = 440.0 * (2.0 ** ((midi_note - 69) / 12.0))
@@ -168,16 +214,16 @@ class AudioEngine(QObject):
         attack = min(int(0.005 * self.sample_rate), n_samples // 4)
         release = min(int(0.08 * self.sample_rate), n_samples // 2)
         env = np.ones(n_samples, dtype=np.float32)
-        if attack > 0:
+        if apply_attack and attack > 0:
             env[:attack] = np.linspace(0.0, 1.0, attack, dtype=np.float32)
-        if release > 0:
+        if apply_release and release > 0:
             env[-release:] = np.linspace(1.0, 0.0, release, dtype=np.float32)
 
         shaped = np.clip(wave * env * amp, -1.0, 1.0)
 
-        # Append a tiny silent tail to prevent click when channel is reused
-        tail = np.zeros(int(0.005 * self.sample_rate), dtype=np.float32)
-        shaped = np.concatenate([shaped, tail])
+        if apply_release:
+            tail = np.zeros(int(0.005 * self.sample_rate), dtype=np.float32)
+            shaped = np.concatenate([shaped, tail])
 
         samples = np.ascontiguousarray(shaped * 32767, dtype=np.int16)
         return pygame.mixer.Sound(samples)

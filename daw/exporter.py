@@ -23,6 +23,8 @@ def _generate_wave(
     midi_note: int,
     duration_s: float,
     amp: float,
+    apply_attack: bool = True,
+    apply_release: bool = True,
     sample_rate: int = 44100,
 ) -> np.ndarray:
     """Synthesise a single note as float32 samples in [-1, 1]."""
@@ -53,9 +55,9 @@ def _generate_wave(
     attack = min(int(0.005 * sample_rate), n_samples // 4)
     release = min(int(0.08 * sample_rate), n_samples // 2)
     env = np.ones(n_samples, dtype=np.float32)
-    if attack > 0:
+    if apply_attack and attack > 0:
         env[:attack] = np.linspace(0.0, 1.0, attack, dtype=np.float32)
-    if release > 0:
+    if apply_release and release > 0:
         env[-release:] = np.linspace(1.0, 0.0, release, dtype=np.float32)
 
     return np.clip(w * env * amp, -1.0, 1.0)
@@ -157,9 +159,18 @@ def render_project(
                 start_s = rel_tick * spt
                 dur_s = max(0.04, note.length_tick * spt)
                 amp = max(0.05, min(1.0, note.velocity / 127.0)) * track.volume
+                note_end_tick = note.start_tick + note.length_tick
+                apply_attack = not (loop_i > 0 and note.start_tick == loop_start)
+                apply_release = not (loop_i < loops - 1 and note_end_tick >= loop_end)
 
                 wave = _generate_wave(
-                    track.waveform, note.midi_note, dur_s, amp, sample_rate,
+                    track.waveform,
+                    note.midi_note,
+                    dur_s,
+                    amp,
+                    apply_attack=apply_attack,
+                    apply_release=apply_release,
+                    sample_rate=sample_rate,
                 )
 
                 start_idx = int(start_s * sample_rate)
