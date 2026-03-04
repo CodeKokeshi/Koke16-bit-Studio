@@ -689,7 +689,7 @@ class GenerateMusicDialog(QDialog):
         layout.addWidget(mode_label)
 
         self.radio_loop = QRadioButton(
-            "🔁  Seamless loop  (8 bars — designed to repeat infinitely)"
+            "🔁  Seamless loop  (8/16/32 bars — designed to repeat infinitely)"
         )
         self.radio_onetime = QRadioButton(
             "🎬  One-time play  (longer piece, natural ending)"
@@ -706,6 +706,7 @@ class GenerateMusicDialog(QDialog):
         self._loop_lengths = [
             ("Short (8 bars)",  8),
             ("Medium (16 bars)", 16),
+            ("Long (32 bars)", 32),
         ]
         self._onetime_lengths = [
             ("Medium (16 bars)", 16),
@@ -732,10 +733,10 @@ class GenerateMusicDialog(QDialog):
         if current is None:
             return
         genre = current.data(Qt.ItemDataRole.UserRole)
-        # All Town variants are 32-bar long-form by default.
+        # All Town variants default to seamless 32-bar loops.
         if "Town" in genre:
-            if not self.radio_onetime.isChecked():
-                self.radio_onetime.setChecked(True)
+            if not self.radio_loop.isChecked():
+                self.radio_loop.setChecked(True)
             idx = self.combo_length.findData(32)
             if idx >= 0:
                 self.combo_length.setCurrentIndex(idx)
