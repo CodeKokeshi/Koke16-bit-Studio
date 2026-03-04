@@ -162,6 +162,9 @@ class GenreConfig:
     # Swing: 0.0 = straight, 0.1 = 10% shuffle on 8th notes
     swing: float = 0.0
 
+    # Town vibe: stored so the progression can be built *after* bars_override
+    vibe: str = ""                    # "inland" or "island"; empty = use progressions list
+
     # Extra tracks beyond the standard Lead / Bass / Harmony / Drums
     extra_tracks: list[ExtraTrackConfig] = field(default_factory=list)
 
@@ -621,12 +624,14 @@ def generate_music(genre_name: str, *,
     scale_name = random.choice(cfg.scale_choices)
     scale = _build_scale(root, scale_name)
 
-    # Choose a random chord progression
-    if not cfg.progressions:
+    # Choose a chord progression — if vibe is set, build dynamically to match bar count
+    if cfg.vibe:
+        chord_prog = _town_progression(cfg.vibe, cfg.bars)
+    elif cfg.progressions:
+        chord_prog = list(random.choice(cfg.progressions))
+    else:
         # Fallback: simple I-IV-V-I * bars/4
         chord_prog = [(0, "maj"), (3, "maj"), (4, "maj"), (0, "maj")] * (cfg.bars // 4 or 1)
-    else:
-        chord_prog = list(random.choice(cfg.progressions))
 
     # Ensure progression covers all bars
     while len(chord_prog) < cfg.bars:
