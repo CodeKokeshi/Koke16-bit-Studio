@@ -2728,12 +2728,40 @@ class MainWindow(QMainWindow):
                                 f"{exc}\n\n{tb}")
 
 
+def _resource_path(relative: str) -> str:
+    """Return absolute path to a bundled resource.
+
+    Works both in normal Python execution and when frozen by PyInstaller
+    (sys._MEIPASS points to the temp extraction folder).
+    The project root is one directory above this file (daw/).
+    """
+    if hasattr(sys, "_MEIPASS"):
+        base = sys._MEIPASS  # type: ignore[attr-defined]
+    else:
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative)
+
+
 def run_app():
+    # ── Windows: force taskbar to show our icon instead of python.exe ──
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "KokenStudios.Kokesynth.Station.1"
+        )
+    except Exception:
+        pass
+
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
     app = QApplication(sys.argv)
     app.setApplicationName("Koke16-Bit Studio")
+
+    icon_path = _resource_path("Koke16.png")
+    if os.path.isfile(icon_path):
+        icon = QIcon(icon_path)
+        app.setWindowIcon(icon)
 
     window = MainWindow()
     window.show()

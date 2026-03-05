@@ -1,0 +1,32 @@
+========================================================
+  Kokesynth-Station  —  PyInstaller Build Command
+========================================================
+
+Run this from the project root (where main.py lives),
+with the .venv activated:
+
+  .venv\Scripts\activate
+
+Then:
+
+  pyinstaller --onefile --windowed ^
+    --icon=Koke16.ico ^
+    --name="Kokesynth-Station" ^
+    --add-data "assets;assets" ^
+    --add-data "Koke16.png;." ^
+    main.py
+
+OUTPUT
+  dist\Kokesynth-Station.exe
+
+NOTES
+  --onefile      bundles everything into a single .exe
+  --windowed     suppresses the console window
+  --icon         sets the .exe / taskbar icon (uses Koke16.ico)
+  --add-data     copies assets/ folder and Koke16.png into the bundle
+                 so they are accessible at runtime via sys._MEIPASS
+
+  If you want a faster launch (at the cost of a larger folder), swap
+  --onefile for --onedir.
+
+========================================================
