@@ -888,3 +888,81 @@ class GenerateMusicDialog(QDialog):
         if item:
             return item.data(Qt.ItemDataRole.UserRole)
         return None
+
+
+# ════════════════════════════════════════════════════════════════════
+# Theme chooser dialog
+# ════════════════════════════════════════════════════════════════════
+
+class ThemeDialog(QDialog):
+    """Two-section dialog: colour-mode toggle (Light / Dark) and theme list."""
+
+    def __init__(self, current_mode: str, current_theme: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("🎨 Choose Theme")
+        self.resize(420, 480)
+
+        from daw.themes import THEME_CATALOGUE
+
+        layout = QVBoxLayout(self)
+
+        title = QLabel("Appearance")
+        title.setStyleSheet("font-size: 15px; font-weight: 700;")
+        layout.addWidget(title)
+
+        # ── Colour mode ───────────────────────────────────────────
+        mode_label = QLabel("Colour mode")
+        mode_label.setStyleSheet("font-size: 13px; font-weight: 600; margin-top: 4px;")
+        layout.addWidget(mode_label)
+
+        mode_row = QHBoxLayout()
+        self.radio_dark = QRadioButton("🌙  Dark")
+        self.radio_light = QRadioButton("☀️  Light")
+        if current_mode == "light":
+            self.radio_light.setChecked(True)
+        else:
+            self.radio_dark.setChecked(True)
+        mode_row.addWidget(self.radio_dark)
+        mode_row.addWidget(self.radio_light)
+        mode_row.addStretch()
+        layout.addLayout(mode_row)
+
+        # ── Theme list ────────────────────────────────────────────
+        theme_label = QLabel("Visual theme")
+        theme_label.setStyleSheet("font-size: 13px; font-weight: 600; margin-top: 8px;")
+        layout.addWidget(theme_label)
+
+        self.theme_list = QListWidget()
+        for theme_id, (display_name, description, _builder) in THEME_CATALOGUE.items():
+            item = QListWidgetItem(f"{display_name}  —  {description}")
+            item.setData(Qt.ItemDataRole.UserRole, theme_id)
+            self.theme_list.addItem(item)
+            if theme_id == current_theme:
+                self.theme_list.setCurrentItem(item)
+        if self.theme_list.currentRow() < 0:
+            self.theme_list.setCurrentRow(0)
+        layout.addWidget(self.theme_list, 1)
+
+        note = QLabel(
+            "⚠️  Applying a new theme requires a restart.\n"
+            "     You will be prompted to save unsaved work."
+        )
+        note.setStyleSheet("color: #aaaaaa; font-size: 11px; margin-top: 4px;")
+        layout.addWidget(note)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Apply && Restart")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def selected_mode(self) -> str:
+        return "light" if self.radio_light.isChecked() else "dark"
+
+    def selected_theme(self) -> str:
+        item = self.theme_list.currentItem()
+        if item:
+            return item.data(Qt.ItemDataRole.UserRole)
+        return "retro_neon"

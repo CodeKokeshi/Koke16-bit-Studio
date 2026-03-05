@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
 )
 
 from daw.audio import AudioEngine
-from daw.dialogs import AddTrackDialog, BeautifyDialog, GenerateMusicDialog, HelpDialog, RoleInstrumentDialog, ShortcutSettingsDialog
+from daw.dialogs import AddTrackDialog, BeautifyDialog, GenerateMusicDialog, HelpDialog, RoleInstrumentDialog, ShortcutSettingsDialog, ThemeDialog
 from daw.generator import generate_music
 from daw.exporter import export_wav
 from daw.sheet_export import export_sheet_image
@@ -48,6 +48,8 @@ from daw.instruments import INSTRUMENT_LIBRARY, ROLE_INSTRUMENT_MAP, AUTO_ROLES,
 from daw.theory import SmartTheoryFixer, detect_track_role, remove_gaps, balance_tracks, fix_loops
 from daw.undo import ProjectUndoManager
 from daw.sheet_reader import SheetReaderThread
+from daw.themes import DEFAULT_MODE, DEFAULT_THEME, get_theme_qss
+from daw.project_io import _project_to_dict
 
 # Recommended volume levels per musical role (0.0 – 1.0)
 _AUTO_VOLUME_ROLES: dict[str, float] = {
@@ -65,36 +67,14 @@ _AUTO_VOLUME_ROLES: dict[str, float] = {
 }
 
 
-APP_QSS = """
-QMainWindow, QWidget { background: #101010; color: #e7e7e7; font-family: Segoe UI; }
-QPushButton { background: #1f1f1f; border: 1px solid #343434; border-radius: 6px; padding: 6px 10px; }
-QPushButton:hover { border-color: #00ffc8; color: #00ffc8; }
-QPushButton:checked { border-color: #00ffc8; color: #00ffc8; }
-QPushButton#playing { border-color: #ff4444; color: #ff4444; }
-QListWidget { background: #121212; border: 1px solid #2a2a2a; border-radius: 6px; }
-QListWidget::item { padding: 2px 4px; border-bottom: 1px solid #1a1a1a; }
-QListWidget::item:selected { background: #1a2e2a; border-left: 3px solid #00ffc8; }
-QListWidget::item:hover { background: #181818; }
-QFrame#panel { background: #111111; border: 1px solid #292929; border-radius: 8px; }
-QLabel#title { color: #00ffc8; font-size: 20px; font-weight: 700; }
-QLabel#trackName { font-size: 12px; font-weight: 600; color: #e0e0e0; }
-QLabel#trackMeta { font-size: 10px; color: #777777; }
-QLabel#trackRole { font-size: 10px; font-weight: 700; border-radius: 3px; padding: 1px 5px; }
-QProgressBar#volumeBar { background: #1a1a1a; border: none; border-radius: 2px; max-height: 4px; }
-QProgressBar#volumeBar::chunk { background: #00ffc8; border-radius: 2px; }
-QRadioButton { color: #e7e7e7; spacing: 6px; }
-QRadioButton::indicator { width: 14px; height: 14px; border: 2px solid #555555; border-radius: 9px; background: #1a1a1a; }
-QRadioButton::indicator:hover { border-color: #00ffc8; }
-QRadioButton::indicator:checked { border-color: #00ffc8; background: #00ffc8; }
-QRadioButton::indicator:checked:hover { background: #00ffc8; border-color: #00ffc8; }
-QRadioButton:disabled { color: #555555; }
-QRadioButton::indicator:disabled { border-color: #333333; background: #1a1a1a; }
-QCheckBox { color: #e7e7e7; spacing: 6px; }
-QCheckBox::indicator { width: 14px; height: 14px; border: 2px solid #555555; border-radius: 3px; background: #1a1a1a; }
-QCheckBox::indicator:hover { border-color: #00ffc8; }
-QCheckBox::indicator:checked { border-color: #00ffc8; background: #00ffc8; }
-QProgressDialog { min-width: 420px; }
-"""
+import json as _json
+
+
+def _load_app_qss(settings: QSettings) -> str:
+    """Build the application stylesheet from persisted theme settings."""
+    theme_id = settings.value("theme/id", DEFAULT_THEME, str) or DEFAULT_THEME
+    mode = settings.value("theme/mode", DEFAULT_MODE, str) or DEFAULT_MODE
+    return get_theme_qss(theme_id, mode)
 
 # Role colours used in the track list
 _ROLE_COLORS: dict[str, str] = {
@@ -340,7 +320,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Koke16-Bit Studio")
         self.resize(1400, 860)
         self.setMinimumSize(1100, 700)
-        self.setStyleSheet(APP_QSS)
 
         self._active_note: NoteEvent | None = None
         self._hum_recording = False
@@ -362,9 +341,16 @@ class MainWindow(QMainWindow):
         self._material_icon_codepoints: dict[str, str] = self._load_material_icon_codepoints()
         self._material_icon_font: QFont | None = self._load_material_icon_font()
 
+        # ── Dirty-state tracking ──────────────────────────────────
+        self._last_saved_snapshot: str | None = None   # JSON of _project_to_dict
+        self._skip_close_prompt = False
+
+        self.setStyleSheet(_load_app_qss(self._settings_store))
+
         self._build_ui()
         self._wire_signals()
         self._refresh_track_list()
+        self._take_clean_snapshot()   # mark initial state as "clean"
 
     def _build_ui(self):
         root = QWidget()
@@ -391,18 +377,11 @@ class MainWindow(QMainWindow):
 
         top_row.addStretch(1)
 
-        self.btn_tab_file = QPushButton("File")
-        self.btn_tab_file.setCheckable(True)
-        self.btn_tab_studio = QPushButton("Studio")
-        self.btn_tab_studio.setCheckable(True)
-        self.btn_tab_magic = QPushButton("Magic")
-        self.btn_tab_magic.setCheckable(True)
+        self.btn_theme = QPushButton("🎨 Theme")
         self.btn_settings = QPushButton("Settings")
         self.btn_help = QPushButton("Help")
 
-        top_row.addWidget(self.btn_tab_file)
-        top_row.addWidget(self.btn_tab_studio)
-        top_row.addWidget(self.btn_tab_magic)
+        top_row.addWidget(self.btn_theme)
         top_row.addWidget(self.btn_settings)
         top_row.addWidget(self.btn_help)
 
@@ -411,10 +390,6 @@ class MainWindow(QMainWindow):
         toolbar_row = QHBoxLayout()
         toolbar_row.setContentsMargins(0, 0, 0, 0)
         toolbar_row.setSpacing(0)
-
-        self.toolbar_stack = QStackedWidget()
-        toolbar_row.addWidget(self.toolbar_stack, 1)
-        header_layout.addLayout(toolbar_row)
 
         file_toolbar = QWidget()
         file_toolbar_layout = QHBoxLayout(file_toolbar)
@@ -655,12 +630,10 @@ class MainWindow(QMainWindow):
         sep_left = QFrame()
         sep_left.setFrameShape(QFrame.Shape.VLine)
         sep_left.setFrameShadow(QFrame.Shadow.Plain)
-        sep_left.setStyleSheet("color:#2e2e2e;")
 
         sep_right = QFrame()
         sep_right.setFrameShape(QFrame.Shape.VLine)
         sep_right.setFrameShadow(QFrame.Shadow.Plain)
-        sep_right.setStyleSheet("color:#2e2e2e;")
 
         combined_toolbar_layout.addWidget(file_toolbar, 0, Qt.AlignmentFlag.AlignLeft)
         combined_toolbar_layout.addWidget(sep_left)
@@ -670,9 +643,9 @@ class MainWindow(QMainWindow):
         combined_toolbar_layout.addWidget(sep_right)
         combined_toolbar_layout.addWidget(magic_toolbar, 0, Qt.AlignmentFlag.AlignRight)
 
-        self.toolbar_stack.addWidget(combined_toolbar)
+        toolbar_row.addWidget(combined_toolbar, 1)
+        header_layout.addLayout(toolbar_row)
         self._refresh_transport_buttons()
-        self._set_toolbar_mode("studio")
 
         main.addWidget(header)
 
@@ -934,9 +907,7 @@ class MainWindow(QMainWindow):
             self.btn_play_this.setEnabled(True)
 
     def _wire_signals(self):
-        self.btn_tab_file.clicked.connect(lambda: self._set_toolbar_mode("file"))
-        self.btn_tab_studio.clicked.connect(lambda: self._set_toolbar_mode("studio"))
-        self.btn_tab_magic.clicked.connect(lambda: self._set_toolbar_mode("magic"))
+        self.btn_theme.clicked.connect(self._on_open_theme)
         self.btn_settings.clicked.connect(self._open_settings)
         self.btn_help.clicked.connect(self._open_help)
 
@@ -986,19 +957,6 @@ class MainWindow(QMainWindow):
         self.audio.position_changed.connect(self.editor.set_playhead)
         self._refresh_recent_projects_view()
 
-    def _set_toolbar_mode(self, mode: str):
-        is_file = mode == "file"
-        is_studio = mode == "studio"
-        is_magic = mode == "magic"
-        self.btn_tab_file.setChecked(is_file)
-        self.btn_tab_studio.setChecked(is_studio)
-        self.btn_tab_magic.setChecked(is_magic)
-        if self.toolbar_stack.count() <= 1:
-            self.toolbar_stack.setCurrentIndex(0)
-            return
-        mode_to_index = {"file": 0, "studio": 1, "magic": 2}
-        self.toolbar_stack.setCurrentIndex(mode_to_index.get(mode, 1))
-
     def _open_settings(self):
         dialog = ShortcutSettingsDialog(self.editor.shortcut_config(), self)
         dialog.setModal(True)
@@ -1010,6 +968,87 @@ class MainWindow(QMainWindow):
         dialog = HelpDialog(self.editor.shortcut_config(), self)
         dialog.setModal(True)
         dialog.exec()
+
+    # ── Dirty-state (unsaved changes) helpers ─────────────────────
+
+    def _take_clean_snapshot(self) -> None:
+        """Record the current project state as the "clean" baseline."""
+        self._last_saved_snapshot = _json.dumps(
+            _project_to_dict(self.project), separators=(",", ":"), sort_keys=True
+        )
+
+    def _is_dirty(self) -> bool:
+        """Return True when the project has unsaved changes."""
+        current = _json.dumps(
+            _project_to_dict(self.project), separators=(",", ":"), sort_keys=True
+        )
+        return current != self._last_saved_snapshot
+
+    def _confirm_discard_changes(self) -> bool:
+        """Show a save-prompt if the project is dirty.
+
+        Returns True if it is safe to proceed (saved or discarded).
+        Returns False if the user cancelled.
+        """
+        if not self._is_dirty():
+            return True
+
+        result = QMessageBox.warning(
+            self,
+            "Unsaved Changes",
+            "You have unsaved changes. Do you want to save before continuing?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if result == QMessageBox.StandardButton.Save:
+            self._on_save_project()
+            # If the user cancelled the save dialog, still dirty → abort.
+            return not self._is_dirty()
+        if result == QMessageBox.StandardButton.Discard:
+            return True
+        return False  # Cancel
+
+    # ── Close event ───────────────────────────────────────────────
+
+    def closeEvent(self, event):
+        """Prompt the user to save if there are unsaved changes."""
+        if self._skip_close_prompt or self._confirm_discard_changes():
+            event.accept()
+        else:
+            event.ignore()
+
+    # ── Theme dialog ──────────────────────────────────────────────
+
+    def _on_open_theme(self):
+        current_theme = self._settings_store.value("theme/id", "retro_neon", str) or "retro_neon"
+        current_mode = self._settings_store.value("theme/mode", "dark", str) or "dark"
+        dialog = ThemeDialog(current_mode, current_theme, self)
+        dialog.setModal(True)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        new_theme = dialog.selected_theme()
+        new_mode = dialog.selected_mode()
+        if new_theme == current_theme and new_mode == current_mode:
+            return
+        # Persist choices
+        self._settings_store.setValue("theme/id", new_theme)
+        self._settings_store.setValue("theme/mode", new_mode)
+        # Ask user to restart
+        if not self._confirm_discard_changes():
+            return
+        QMessageBox.information(
+            self,
+            "Theme Changed",
+            f"Theme set to {new_theme} ({new_mode}).\n\n"
+            "The application will now restart to apply the new theme.",
+        )
+        # Restart the application
+        import subprocess
+        subprocess.Popen([sys.executable] + sys.argv)
+        self._skip_close_prompt = True
+        QApplication.quit()
 
     # ── Project-level undo / redo ──────────────────────────────────
 
@@ -1147,11 +1186,12 @@ class MainWindow(QMainWindow):
 
     def _update_window_title(self) -> None:
         base = "Koke16-Bit Studio"
+        dirty = " •" if self._is_dirty() else ""
         if self._project_file_path:
             name = os.path.basename(self._project_file_path)
-            self.setWindowTitle(f"{name} — {base}")
+            self.setWindowTitle(f"{name}{dirty} — {base}")
         else:
-            self.setWindowTitle(base)
+            self.setWindowTitle(f"{base}{dirty}")
 
     def _collect_session_state(self) -> dict:
         return {
@@ -1268,6 +1308,8 @@ class MainWindow(QMainWindow):
         editor_state = session_state.get("editor", {})
         self.editor.apply_view_state(editor_state)
 
+        self._take_clean_snapshot()
+
     def _load_project_from_path(self, path: str):
         try:
             loaded = load_kokestudio_file(path)
@@ -1302,6 +1344,7 @@ class MainWindow(QMainWindow):
             self._project_file_path = path
             self._push_recent_project(path)
             self._update_window_title()
+            self._take_clean_snapshot()
             self.status.showMessage(f"Project saved: {path}", 3000)
         except Exception as exc:
             QMessageBox.warning(self, "Save Failed", f"Could not save project:\n{exc}")
