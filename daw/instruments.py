@@ -36,9 +36,11 @@ SYNTH_PRESETS: dict[str, SynthPreset] = {
     "NES Pulse 25%": SynthPreset(attack=0.002, decay=0.04, sustain=0.80, release=0.06, filter_cutoff=0.80),
     "NES Noise":     SynthPreset(attack=0.001, decay=0.10, sustain=0.0,  release=0.03),
 
-    # --- Gameboy family ---
+    # --- Gameboy family (DMG-01: 2× pulse, 1× wave, 1× noise) ---
     "Gameboy Square":      SynthPreset(attack=0.001, decay=0.05, sustain=0.75, release=0.05, filter_cutoff=0.78),
     "Gameboy Pulse 12.5%": SynthPreset(attack=0.001, decay=0.05, sustain=0.70, release=0.05, filter_cutoff=0.75),
+    "Gameboy Wave":        SynthPreset(attack=0.002, decay=0.04, sustain=0.80, release=0.06, filter_cutoff=0.72),
+    "Gameboy Noise":       SynthPreset(attack=0.001, decay=0.08, sustain=0.0,  release=0.03, filter_cutoff=0.70),
 
     # --- SNES family (richer, more "produced" sound) ---
     "SNES Flute":     SynthPreset(attack=0.06,  decay=0.05, sustain=0.90, release=0.18,
@@ -107,6 +109,8 @@ INSTRUMENT_LIBRARY: list[dict[str, str]] = [
     {"name": "NES Noise", "waveform": "noise", "family": "NES"},
     {"name": "Gameboy Square", "waveform": "square", "family": "Gameboy"},
     {"name": "Gameboy Pulse 12.5%", "waveform": "pulse12", "family": "Gameboy"},
+    {"name": "Gameboy Wave", "waveform": "triangle", "family": "Gameboy"},
+    {"name": "Gameboy Noise", "waveform": "noise", "family": "Gameboy"},
     {"name": "SNES Flute", "waveform": "sine", "family": "SNES"},
     {"name": "SNES Strings", "waveform": "sawtooth", "family": "SNES"},
     {"name": "SNES Acoustic", "waveform": "triangle", "family": "SNES"},
@@ -130,3 +134,62 @@ INSTRUMENT_LIBRARY: list[dict[str, str]] = [
     {"name": "GBA Steel Drums", "waveform": "triangle", "family": "GBA"},
     {"name": "GBA Light Kit", "waveform": "noise", "family": "GBA"},
 ]
+
+# ── Role → Platform → Best instrument mapping ───────────────────────
+# Used by "Change Instrument (Auto)" to pick the best-fit instrument
+# for a given musical role and hardware platform.
+
+ROLE_INSTRUMENT_MAP: dict[str, dict[str, dict[str, str]]] = {
+    "Lead": {
+        "Generic":  {"name": "Generic Sine",        "waveform": "sine"},
+        "NES":      {"name": "NES Pulse 25%",       "waveform": "pulse25"},
+        "Gameboy":  {"name": "Gameboy Square",      "waveform": "square"},
+        "SNES":     {"name": "SNES Flute",          "waveform": "sine"},
+        "GBA":      {"name": "GBA Flute",           "waveform": "sine"},
+    },
+    "Bass": {
+        "Generic":  {"name": "Generic Triangle",    "waveform": "triangle"},
+        "NES":      {"name": "NES Triangle",        "waveform": "triangle"},
+        "Gameboy":  {"name": "Gameboy Wave",        "waveform": "triangle"},
+        "SNES":     {"name": "SNES Slap Bass",      "waveform": "square"},
+        "GBA":      {"name": "GBA Fretless Bass",   "waveform": "triangle"},
+    },
+    "Harmony": {
+        "Generic":  {"name": "Generic Pulse 25%",   "waveform": "pulse25"},
+        "NES":      {"name": "NES Square",          "waveform": "square"},
+        "Gameboy":  {"name": "Gameboy Square",      "waveform": "square"},
+        "SNES":     {"name": "SNES Piano",          "waveform": "pulse25"},
+        "GBA":      {"name": "GBA Piano",           "waveform": "pulse25"},
+    },
+    "Pad / Strings": {
+        "Generic":  {"name": "Generic Saw",         "waveform": "sawtooth"},
+        "NES":      {"name": "NES Square",          "waveform": "square"},
+        "Gameboy":  {"name": "Gameboy Wave",        "waveform": "triangle"},
+        "SNES":     {"name": "SNES Strings",        "waveform": "sawtooth"},
+        "GBA":      {"name": "GBA Strings",         "waveform": "sawtooth"},
+    },
+    "Drums": {
+        "Generic":  {"name": "Generic Noise Drum",  "waveform": "noise"},
+        "NES":      {"name": "NES Noise",           "waveform": "noise"},
+        "Gameboy":  {"name": "Gameboy Noise",       "waveform": "noise"},
+        "SNES":     {"name": "SNES Kit",            "waveform": "noise"},
+        "GBA":      {"name": "GBA Light Kit",       "waveform": "noise"},
+    },
+    "Melody 2 / Counter": {
+        "Generic":  {"name": "Generic Square",      "waveform": "square"},
+        "NES":      {"name": "NES Square",          "waveform": "square"},
+        "Gameboy":  {"name": "Gameboy Pulse 12.5%", "waveform": "pulse12"},
+        "SNES":     {"name": "SNES Trumpet",        "waveform": "sawtooth"},
+        "GBA":      {"name": "GBA Muted Trumpet",   "waveform": "sawtooth"},
+    },
+    "Arpeggio / Bells": {
+        "Generic":  {"name": "Generic Triangle",    "waveform": "triangle"},
+        "NES":      {"name": "NES Triangle",        "waveform": "triangle"},
+        "Gameboy":  {"name": "Gameboy Square",      "waveform": "square"},
+        "SNES":     {"name": "SNES Harp",           "waveform": "sine"},
+        "GBA":      {"name": "GBA Glockenspiel",    "waveform": "triangle"},
+    },
+}
+
+AUTO_ROLES = list(ROLE_INSTRUMENT_MAP.keys())
+AUTO_PLATFORMS = ["Generic", "NES", "Gameboy", "SNES", "GBA", "Random"]

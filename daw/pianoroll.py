@@ -37,6 +37,7 @@ class PianoRollCanvas(QWidget):
         super().__init__(parent)
         self.track: Track | None = None
         self.playhead_tick = 0
+        self._music_end_tick: int = 0        # project-wide end-of-music marker
         self.selected_note: NoteEvent | None = None
         self.selected_note_ids: set[int] = set()
         self.hover_note: NoteEvent | None = None
@@ -190,9 +191,25 @@ class PianoRollCanvas(QWidget):
             self.note_selected.emit(self.selected_note)
         self.update()
 
+    # ------------------------------------------------------------------
+    @property
+    def effective_total_ticks(self) -> int:
+        """Total displayable ticks — at least TOTAL_TICKS but grows to fit content."""
+        content_end = self._music_end_tick
+        if self.track and self.track.notes:
+            content_end = max(content_end,
+                              max(n.start_tick + n.length_tick for n in self.track.notes))
+        return max(self.TOTAL_TICKS, content_end + 16)   # +16 ticks of padding
+
+    def set_music_end_tick(self, tick: int):
+        """Set the project-wide end-of-music position (drawn as a marker)."""
+        self._music_end_tick = max(0, tick)
+        self._update_canvas_size()
+        self.update()
+
     def _update_canvas_size(self):
         self.setMinimumSize(
-            self.KEY_WIDTH + self.TOTAL_TICKS * self.tick_width,
+            self.KEY_WIDTH + self.effective_total_ticks * self.tick_width,
             (self.NOTE_TOP - self.NOTE_BOTTOM + 1) * self.ROW_HEIGHT,
         )
 
@@ -230,6 +247,7 @@ class PianoRollCanvas(QWidget):
         self.hover_edge = None
         self._undo_stack.clear()
         self._redo_stack.clear()
+        self._update_canvas_size()      # resize to fit content
         self.update()
 
     def set_playhead(self, tick: int):
@@ -243,7 +261,7 @@ class PianoRollCanvas(QWidget):
         return self.NOTE_TOP - row
 
     def x_to_tick(self, x: int) -> int:
-        return max(0, min(self.TOTAL_TICKS - 1, int((x - self.KEY_WIDTH) / self.tick_width)))
+        return max(0, min(self.effective_total_ticks - 1, int((x - self.KEY_WIDTH) / self.tick_width)))
 
     def y_to_pitch(self, y: int) -> int:
         row = max(0, min(self.NOTE_TOP - self.NOTE_BOTTOM, int(y / self.ROW_HEIGHT)))
@@ -559,7 +577,8 @@ class PianoRollCanvas(QWidget):
             p.drawText(6, y + self.ROW_HEIGHT - 5, midi_name(midi_note))
 
         # vertical timeline grid
-        for t in range(self.TOTAL_TICKS + 1):
+        total = self.effective_total_ticks
+        for t in range(total + 1):
             x = self.KEY_WIDTH + t * self.tick_width
             if t % 16 == 0:
                 c = QColor("#3f3f3f")
@@ -569,6 +588,18 @@ class PianoRollCanvas(QWidget):
                 c = QColor("#1c1c1c")
             p.setPen(QPen(c, 1))
             p.drawLine(x, 0, x, height)
+
+        # ── end-of-music marker ──────────────────────────────────
+        if self._music_end_tick > 0:
+            ex = self.KEY_WIDTH + self._music_end_tick * self.tick_width
+            # translucent red stripe
+            p.fillRect(ex, 0, max(2, self.tick_width), height, QColor("#ff355520"))
+            p.setPen(QPen(QColor("#ff3555"), 2, Qt.PenStyle.DashLine))
+            p.drawLine(ex, 0, ex, height)
+            # tiny label
+            p.setPen(QColor("#ff3555"))
+            p.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+            p.drawText(ex + 4, 12, "END")
 
         # playhead
         px = self.KEY_WIDTH + self.playhead_tick * self.tick_width
@@ -619,6 +650,8 @@ class StartMarkerBar(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._tick = 0
+        self._end_tick = 0              # end-of-music marker (non-draggable)
+        self._max_tick = PianoRollCanvas.TOTAL_TICKS  # dynamic upper bound
         self._scroll_x = 0
         self._tick_width = PianoRollCanvas.TICK_WIDTH
         self.setFixedHeight(26)
@@ -628,10 +661,20 @@ class StartMarkerBar(QWidget):
         return self._tick
 
     def set_tick(self, tick: int):
-        bounded = max(0, min(PianoRollCanvas.TOTAL_TICKS - 1, tick))
+        bounded = max(0, min(self._max_tick - 1, tick))
         if bounded == self._tick:
             return
         self._tick = bounded
+        self.update()
+
+    def set_end_tick(self, tick: int):
+        """Set end-of-music visual marker (non-draggable)."""
+        self._end_tick = max(0, tick)
+        self._max_tick = max(PianoRollCanvas.TOTAL_TICKS, self._end_tick + 16)
+        self.update()
+
+    def set_max_tick(self, value: int):
+        self._max_tick = max(PianoRollCanvas.TOTAL_TICKS, value)
         self.update()
 
     def set_scroll_x(self, value: int):
@@ -658,7 +701,7 @@ class StartMarkerBar(QWidget):
     def _set_tick_from_x(self, x: int):
         canvas_x = x + self._scroll_x
         tick = int((canvas_x - PianoRollCanvas.KEY_WIDTH) / self._tick_width)
-        bounded = max(0, min(PianoRollCanvas.TOTAL_TICKS - 1, tick))
+        bounded = max(0, min(self._max_tick - 1, tick))
         if bounded != self._tick:
             self._tick = bounded
             self.tick_changed.emit(self._tick)
@@ -691,6 +734,23 @@ class StartMarkerBar(QWidget):
                 QPoint(marker_x - tri_half, center_y + tri_half),
                 QPoint(marker_x + tri_half, center_y),
             ])
+
+        # ── end-of-music marker (non-draggable) ──────────────────
+        if self._end_tick > 0:
+            end_x = PianoRollCanvas.KEY_WIDTH + self._end_tick * self._tick_width - self._scroll_x
+            if -10 <= end_x <= w + 10:
+                p.setPen(QPen(QColor("#ff3555"), 2))
+                p.drawLine(end_x, 0, end_x, h)
+
+                sq = 5
+                center_y = 9
+                p.setBrush(QColor("#ff3555"))
+                p.setPen(QPen(QColor("#ff3555"), 1))
+                p.drawRect(end_x - sq, center_y - sq, sq * 2, sq * 2)
+
+                p.setPen(QColor("#ffffff"))
+                p.setFont(QFont("Segoe UI", 6, QFont.Weight.Bold))
+                p.drawText(end_x + sq + 3, center_y + 4, "END")
 
         p.end()
 
@@ -757,6 +817,14 @@ class PianoRollEditor(QWidget):
 
     def set_track(self, track: Track | None):
         self.canvas.set_track(track)
+        # keep start-marker bar in sync with canvas extent
+        self.start_marker.set_max_tick(self.canvas.effective_total_ticks)
+
+    def set_music_end_tick(self, tick: int):
+        """Set end-of-music marker on both the canvas and the start-marker bar."""
+        self.canvas.set_music_end_tick(tick)
+        self.start_marker.set_end_tick(tick)
+        self.start_marker.set_max_tick(self.canvas.effective_total_ticks)
 
     def set_playhead(self, tick: int):
         self.canvas.set_playhead(tick)

@@ -647,12 +647,46 @@ class HelpDialog(QDialog):
         return " + ".join(parts) if parts else "None"
 
 class GenerateMusicDialog(QDialog):
-    """Modal dialog to select a genre/mood for procedural music generation."""
+    """Modal dialog to select a genre/mood for procedural music generation.
+
+    Uses a two-click Category → Variant hierarchy so the list stays
+    manageable even with 60+ genres.
+    """
+
+    # ── Category definitions ──────────────────────────────────────
+    _CATEGORIES: list[tuple[str, str]] = [
+        ("Town",        "🏘️"),
+        ("Cave",        "🕳️"),
+        ("HM Town",     "🌾"),
+        ("Zelda Town",  "🧝"),
+        ("Dungeon",     "🏚️"),
+        ("Combat",      "⚔️"),
+        ("Encounter",   "❗"),
+        ("Boss Battle", "👹"),
+        ("Overworld",   "🗺️"),
+        ("Victory",     "🏆"),
+    ]
+    _PLATFORMS: list[tuple[str, str]] = [
+        ("Generic",  "🎵"),
+        ("NES",      "🎮"),
+        ("Gameboy",  "🕹️"),
+        ("GBA",      "📱"),
+        ("SNES",     "🖥️"),
+        ("Mix",      "🎲"),
+    ]
+
+    @staticmethod
+    def _genre_key(platform: str, category: str) -> str:
+        """Build the genre dict key from platform + category names."""
+        # Town & Cave in generator.py use 'Platform Category' (no dash).
+        if category in ("Town", "Cave"):
+            return f"{platform} {category}"
+        return f"{platform} - {category}"
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("🎵 Generate Music")
-        self.resize(420, 480)
+        self.resize(560, 520)
 
         layout = QVBoxLayout(self)
 
@@ -661,27 +695,47 @@ class GenerateMusicDialog(QDialog):
         layout.addWidget(title)
 
         desc = QLabel(
-            "Select a genre and click Generate to create a full\n"
-            "multi-track song. Track count varies by genre."
+            "Pick a category on the left, then choose a platform\n"
+            "variant on the right and click Generate."
         )
         desc.setStyleSheet("color: #aaaaaa; font-size: 12px;")
         layout.addWidget(desc)
 
-        self.list_widget = QListWidget()
-        _GENRE_ICONS = {
-            "Generic Town": "🏘️",
-            "GBA Town":     "🏡",
-            "SNES Town":    "🏰",
-        }
-        for name in GENRE_NAMES:
-            icon = _GENRE_ICONS.get(name, "🎵")
-            item = QListWidgetItem(f"{icon}  {name}")
-            item.setData(Qt.ItemDataRole.UserRole, name)
-            self.list_widget.addItem(item)
-        self.list_widget.setCurrentRow(0)
-        self.list_widget.currentItemChanged.connect(self._on_genre_changed)
-        self.list_widget.itemDoubleClicked.connect(lambda _: self.accept())
-        layout.addWidget(self.list_widget)
+        # ── Two-panel genre selector ──────────────────────────────
+        panels = QHBoxLayout()
+
+        # Left panel – categories
+        left_vbox = QVBoxLayout()
+        cat_label = QLabel("Category")
+        cat_label.setStyleSheet("font-size: 12px; font-weight: 600;")
+        left_vbox.addWidget(cat_label)
+        self.category_list = QListWidget()
+        self.category_list.setFixedWidth(180)
+        for cat_name, cat_icon in self._CATEGORIES:
+            item = QListWidgetItem(f"{cat_icon}  {cat_name}")
+            item.setData(Qt.ItemDataRole.UserRole, cat_name)
+            self.category_list.addItem(item)
+        left_vbox.addWidget(self.category_list)
+        panels.addLayout(left_vbox)
+
+        # Right panel – platform variants
+        right_vbox = QVBoxLayout()
+        var_label = QLabel("Platform variant")
+        var_label.setStyleSheet("font-size: 12px; font-weight: 600;")
+        right_vbox.addWidget(var_label)
+        self.variant_list = QListWidget()
+        right_vbox.addWidget(self.variant_list)
+        panels.addLayout(right_vbox, 1)
+
+        layout.addLayout(panels, 1)
+
+        # Wire up selection
+        self.category_list.currentItemChanged.connect(self._on_category_changed)
+        self.variant_list.currentItemChanged.connect(self._on_variant_changed)
+        self.variant_list.itemDoubleClicked.connect(lambda _: self.accept())
+
+        # Select first category to populate the right panel
+        self.category_list.setCurrentRow(0)
 
         # ── Playback mode ─────────────────────────────────────────
         mode_label = QLabel("Playback mode")
@@ -715,10 +769,34 @@ class GenerateMusicDialog(QDialog):
             ("Marathon (64 bars)", 64),
         ]
         self._update_length_choices()
+        default_idx = self.combo_length.findData(16)
+        if default_idx >= 0:
+            self.combo_length.setCurrentIndex(default_idx)
         self.radio_loop.toggled.connect(self._update_length_choices)
         length_row.addWidget(length_lbl)
         length_row.addWidget(self.combo_length, 1)
         layout.addLayout(length_row)
+
+        # ── Track density selector ─────────────────────────────────
+        density_row = QHBoxLayout()
+        density_lbl = QLabel("Track density:")
+        density_lbl.setStyleSheet("font-size: 12px;")
+        self.combo_density = QComboBox()
+        self._density_choices = [
+            ("Minimal (3 tracks — Lead, Bass, Drums)",  "minimal"),
+            ("Standard (4 tracks — Lead, Bass, Harmony, Drums)", "standard"),
+            ("Rich (5-6 tracks — core + 1-2 extras)",  "rich"),
+            ("Full (all tracks — 6-8, can be noisy)",   "full"),
+        ]
+        for label, value in self._density_choices:
+            self.combo_density.addItem(label, value)
+        # Default to "standard" (4 tracks — balanced mix)
+        default_density = self.combo_density.findData("standard")
+        if default_density >= 0:
+            self.combo_density.setCurrentIndex(default_density)
+        density_row.addWidget(density_lbl)
+        density_row.addWidget(self.combo_density, 1)
+        layout.addLayout(density_row)
 
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -728,16 +806,62 @@ class GenerateMusicDialog(QDialog):
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
-    def _on_genre_changed(self, current, _previous):
+    # ── Category → populate variants ──────────────────────────────
+    def _on_category_changed(self, current, _previous):
+        """Populate the variant list when a category is selected."""
+        self.variant_list.clear()
+        if current is None:
+            return
+        category = current.data(Qt.ItemDataRole.UserRole)
+        for plat_name, plat_icon in self._PLATFORMS:
+            genre_key = self._genre_key(plat_name, category)
+            if genre_key not in GENRE_NAMES:
+                continue
+            item = QListWidgetItem(f"{plat_icon}  {plat_name} — {category}")
+            item.setData(Qt.ItemDataRole.UserRole, genre_key)
+            self.variant_list.addItem(item)
+        if self.variant_list.count():
+            self.variant_list.setCurrentRow(0)
+
+    # ── Smart defaults when variant changes ───────────────────────
+    def _on_variant_changed(self, current, _previous):
         """Apply sensible defaults per genre when user switches selection."""
         if current is None:
             return
         genre = current.data(Qt.ItemDataRole.UserRole)
-        # All Town variants default to seamless 32-bar loops.
+        # All Town variants default to seamless 16-bar loops.
         if "Town" in genre:
             if not self.radio_loop.isChecked():
                 self.radio_loop.setChecked(True)
+            idx = self.combo_length.findData(16)
+            if idx >= 0:
+                self.combo_length.setCurrentIndex(idx)
+        # Cave / Dungeon default to seamless 32-bar loops.
+        elif "Cave" in genre or "Dungeon" in genre:
+            if not self.radio_loop.isChecked():
+                self.radio_loop.setChecked(True)
             idx = self.combo_length.findData(32)
+            if idx >= 0:
+                self.combo_length.setCurrentIndex(idx)
+        # Combat / Boss Battle / Overworld default to 32-bar loops.
+        elif "Combat" in genre or "Boss" in genre or "Overworld" in genre:
+            if not self.radio_loop.isChecked():
+                self.radio_loop.setChecked(True)
+            idx = self.combo_length.findData(32)
+            if idx >= 0:
+                self.combo_length.setCurrentIndex(idx)
+        # Encounter default to shorter 16-bar loops.
+        elif "Encounter" in genre:
+            if not self.radio_loop.isChecked():
+                self.radio_loop.setChecked(True)
+            idx = self.combo_length.findData(16)
+            if idx >= 0:
+                self.combo_length.setCurrentIndex(idx)
+        # Victory/Fanfare default to short 8-bar.
+        elif "Victory" in genre:
+            if not self.radio_loop.isChecked():
+                self.radio_loop.setChecked(True)
+            idx = self.combo_length.findData(8)
             if idx >= 0:
                 self.combo_length.setCurrentIndex(idx)
 
@@ -746,6 +870,9 @@ class GenerateMusicDialog(QDialog):
         choices = self._loop_lengths if self.radio_loop.isChecked() else self._onetime_lengths
         for label, value in choices:
             self.combo_length.addItem(label, value)
+        idx = self.combo_length.findData(16)
+        if idx >= 0:
+            self.combo_length.setCurrentIndex(idx)
 
     def is_loop_mode(self) -> bool:
         return self.radio_loop.isChecked()
@@ -753,8 +880,11 @@ class GenerateMusicDialog(QDialog):
     def selected_bars(self) -> int:
         return self.combo_length.currentData() or 8
 
+    def selected_density(self) -> str:
+        return self.combo_density.currentData() or "standard"
+
     def selected_genre(self) -> str | None:
-        item = self.list_widget.currentItem()
+        item = self.variant_list.currentItem()
         if item:
             return item.data(Qt.ItemDataRole.UserRole)
         return None

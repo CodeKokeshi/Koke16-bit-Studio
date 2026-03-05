@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import traceback
 import numpy as np
 import sounddevice as sd
 
@@ -38,13 +39,30 @@ from daw.audio import AudioEngine
 from daw.dialogs import AddTrackDialog, BeautifyDialog, GenerateMusicDialog, HelpDialog, RoleInstrumentDialog, ShortcutSettingsDialog
 from daw.generator import generate_music
 from daw.exporter import export_wav
+from daw.sheet_export import export_sheet_image
 from daw.models import NoteEvent, Project, Track
 from daw.pianoroll import PianoRollEditor, midi_name
 from daw.project_io import ProjectFormatError, load_kokestudio_file, save_kokestudio_file
 from daw.transcriber import audio_to_multitrack_events, load_audio, TranscriptionCancelled
-from daw.instruments import INSTRUMENT_LIBRARY
+from daw.instruments import INSTRUMENT_LIBRARY, ROLE_INSTRUMENT_MAP, AUTO_ROLES, AUTO_PLATFORMS
 from daw.theory import SmartTheoryFixer, detect_track_role, remove_gaps, balance_tracks, fix_loops
 from daw.undo import ProjectUndoManager
+from daw.sheet_reader import SheetReaderThread
+
+# Recommended volume levels per musical role (0.0 – 1.0)
+_AUTO_VOLUME_ROLES: dict[str, float] = {
+    "Lead":           0.85,
+    "Melody":         0.85,
+    "Bass":           0.72,
+    "Harmony":        0.60,
+    "Chord":          0.60,
+    "Arp":            0.65,
+    "Counter-Melody": 0.70,
+    "Drums":          0.70,
+    "Percussion":     0.65,
+    "Ambient":        0.50,
+    "FX":             0.55,
+}
 
 
 APP_QSS = """
@@ -406,9 +424,11 @@ class MainWindow(QMainWindow):
         self.btn_hum_music = QPushButton("Hum → Music")
         self.btn_open_recent = QPushButton("Open Recent")
         self.btn_import_music = QPushButton("Import Audio → Music")
+        self.btn_read_sheet = QPushButton("Read Music Sheet")
         self.btn_load_project = QPushButton("Load Project")
         self.btn_save_project = QPushButton("Save Project")
         self.btn_export = QPushButton("Export WAV")
+        self.btn_export_sheet = QPushButton("Export Music Sheet")
 
         # File toolbar tooltips
         self.btn_generate = QPushButton("Generate")
@@ -448,6 +468,13 @@ class MainWindow(QMainWindow):
             svg_name="hum.svg",
         )
         self._configure_toolbar_icon_button(
+            self.btn_read_sheet,
+            "description",
+            "Read Music Sheet",
+            "Extract notes from a PDF or image of sheet music (OMR)",
+            svg_name="extract_from_music_sheet.svg",
+        )
+        self._configure_toolbar_icon_button(
             self.btn_generate,
             "music_note",
             "Generate Music",
@@ -461,14 +488,23 @@ class MainWindow(QMainWindow):
             "Export all tracks as a WAV file (Ctrl+E)",
             svg_name="export_wav.svg",
         )
+        self._configure_toolbar_icon_button(
+            self.btn_export_sheet,
+            "description",
+            "Export Sheet",
+            "Export all tracks as a music sheet image (PNG/PDF)",
+            svg_name=None,
+        )
 
         file_toolbar_layout.addWidget(self.btn_open_recent)
         file_toolbar_layout.addWidget(self.btn_load_project)
         file_toolbar_layout.addWidget(self.btn_save_project)
         file_toolbar_layout.addWidget(self.btn_import_music)
         file_toolbar_layout.addWidget(self.btn_hum_music)
+        file_toolbar_layout.addWidget(self.btn_read_sheet)
         file_toolbar_layout.addWidget(self.btn_generate)
         file_toolbar_layout.addWidget(self.btn_export)
+        file_toolbar_layout.addWidget(self.btn_export_sheet)
 
         studio_toolbar = QWidget()
         studio_toolbar_layout = QHBoxLayout(studio_toolbar)
@@ -912,6 +948,7 @@ class MainWindow(QMainWindow):
         self.btn_load_project.clicked.connect(self._on_load_project)
         self.btn_save_project.clicked.connect(self._on_save_project)
         self.btn_import_music.clicked.connect(self._on_import_audio_music)
+        self.btn_read_sheet.clicked.connect(self._on_read_sheet)
         self.btn_play_all.clicked.connect(self._on_play_all)
         self.btn_play_this.clicked.connect(self._on_play_this)
         self.btn_stop.clicked.connect(self._on_stop)
@@ -921,6 +958,7 @@ class MainWindow(QMainWindow):
         self.btn_fix_loops.clicked.connect(self._on_fix_loops)
         self.btn_generate.clicked.connect(self._on_generate)
         self.btn_export.clicked.connect(self._on_export_wav)
+        self.btn_export_sheet.clicked.connect(self._on_export_sheet)
         self.spin_bpm.valueChanged.connect(self._on_bpm_changed)
         self.combo_loop_mode.currentIndexChanged.connect(self._on_loop_mode_changed)
         self.spin_loop_beats.valueChanged.connect(self._on_loop_beats_changed)
@@ -1371,6 +1409,80 @@ class MainWindow(QMainWindow):
         audio = np.concatenate(self._hum_chunks).astype(np.float32)
         self._start_audio_import_job(source_label="Hum", audio=audio, sample_rate=self._hum_sample_rate)
 
+    # ── Read Music Sheet (OMR) ─────────────────────────────────────
+
+    def _on_read_sheet(self):
+        """Open a PDF or image, run OMR via oemer + music21, write .txt."""
+        try:
+            file_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Music Sheet (PDF or Image)",
+                "",
+                "Sheet Music (*.pdf *.png *.jpg *.jpeg *.bmp *.tiff *.tif *.gif);;"
+                "PDF Files (*.pdf);;Image Files (*.png *.jpg *.jpeg *.bmp *.tiff *.tif *.gif)",
+            )
+        except Exception:
+            return
+
+        if not file_path:
+            return
+
+        # Ask where to save the output text file
+        output_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Choose Output Directory for Extraction",
+            os.path.dirname(file_path),
+        )
+        if not output_dir:
+            return
+
+        # Progress dialog
+        self._sheet_progress = QProgressDialog(
+            "Initialising OMR…", "Cancel", 0, 0, self
+        )
+        self._sheet_progress.setWindowTitle("Reading Music Sheet")
+        self._sheet_progress.setMinimumWidth(460)
+        self._sheet_progress.setMinimumDuration(0)
+        self._sheet_progress.setCancelButton(None)  # not easily cancellable
+        self._sheet_progress.show()
+        QApplication.processEvents()
+
+        # Launch worker thread
+        self._sheet_thread = SheetReaderThread(file_path, output_dir, parent=self)
+        self._sheet_thread.progress.connect(self._on_sheet_progress)
+        self._sheet_thread.finished_ok.connect(self._on_sheet_done)
+        self._sheet_thread.finished_err.connect(self._on_sheet_error)
+        self._sheet_thread.start()
+
+    def _on_sheet_progress(self, msg: str):
+        if hasattr(self, "_sheet_progress") and self._sheet_progress:
+            self._sheet_progress.setLabelText(msg)
+            QApplication.processEvents()
+
+    def _on_sheet_done(self, txt_path: str):
+        if hasattr(self, "_sheet_progress") and self._sheet_progress:
+            self._sheet_progress.close()
+            self._sheet_progress = None
+        QMessageBox.information(
+            self,
+            "Sheet Music Extracted",
+            f"Extraction complete!\n\nText file saved to:\n{txt_path}",
+        )
+        self.status.showMessage(f"Sheet extraction → {txt_path}", 8000)
+
+    def _on_sheet_error(self, err_msg: str):
+        if hasattr(self, "_sheet_progress") and self._sheet_progress:
+            self._sheet_progress.close()
+            self._sheet_progress = None
+        QMessageBox.critical(
+            self,
+            "Sheet Reader Error",
+            f"An error occurred during sheet music extraction:\n\n{err_msg}",
+        )
+        self.status.showMessage("Sheet extraction failed.", 5000)
+
+    # ── Import Audio → Music ──────────────────────────────────────
+
     def _on_import_audio_music(self):
         try:
             file_path, _ = QFileDialog.getOpenFileName(
@@ -1639,6 +1751,19 @@ class MainWindow(QMainWindow):
                 self.center_tabs.setCurrentWidget(self.center_stack)
 
         self._update_undo_status()
+        self._sync_music_end_marker()        # keep end marker current
+
+    def _project_end_tick(self) -> int:
+        """Compute the furthest end tick across all project tracks."""
+        end = 0
+        for track in self.project.tracks:
+            for note in track.notes:
+                end = max(end, note.start_tick + note.length_tick)
+        return end
+
+    def _sync_music_end_marker(self):
+        """Recompute and push the end-of-music marker to the piano-roll editor."""
+        self.editor.set_music_end_tick(self._project_end_tick())
 
     def _on_track_selected(self, row: int):
         if row < 0 or row >= len(self.project.tracks):
@@ -1651,6 +1776,7 @@ class MainWindow(QMainWindow):
         self.project.selected_track_index = row
         track = self.project.tracks[row]
         self.editor.set_track(track)
+        self._sync_music_end_marker()       # keep end marker updated
         self.track_volume.blockSignals(True)
         self.track_volume.setValue(int(track.volume * 100))
         self.track_volume.blockSignals(False)
@@ -2178,7 +2304,8 @@ class MainWindow(QMainWindow):
 
             loop_mode = dialog.is_loop_mode()
             result = _gen(genre, loop_friendly=loop_mode,
-                          bars_override=dialog.selected_bars())
+                          bars_override=dialog.selected_bars(),
+                          track_density=dialog.selected_density())
 
             # If user is in custom loop mode, ensure the loop is not shorter
             # than the freshly generated song (prevents early "build-up only" loops).
@@ -2214,6 +2341,10 @@ class MainWindow(QMainWindow):
             self.project.selected_track_index = first_idx
             self._refresh_track_list()
             self.list_tracks.setCurrentRow(first_idx)
+
+            # Tell the piano-roll about the music length so the canvas
+            # expands and shows an end-of-music marker.
+            self.editor.set_music_end_tick(result.total_ticks)
 
             self.audio._cache.clear()
 
@@ -2264,6 +2395,23 @@ class MainWindow(QMainWindow):
             action_delete = menu.addAction("Delete Track")
             action_change_inst = menu.addAction("Change Instrument")
 
+            # ── Change Instrument (Auto) submenu: Role → Platform ──
+            auto_menu = menu.addMenu("Change Instrument (Auto)")
+            auto_actions: dict[object, tuple[str, str]] = {}
+            for role in AUTO_ROLES:
+                role_menu = auto_menu.addMenu(role)
+                for platform in AUTO_PLATFORMS:
+                    act = role_menu.addAction(platform)
+                    auto_actions[act] = (role, platform)
+
+            # ── Set Volume (Auto) submenu: pick role ──
+            vol_menu = menu.addMenu("Set Volume (Auto)")
+            vol_actions: dict[object, str] = {}
+            for role_label, vol_val in _AUTO_VOLUME_ROLES.items():
+                pct = int(vol_val * 100)
+                act = vol_menu.addAction(f"{role_label}  ({pct}%)")
+                vol_actions[act] = role_label
+
         menu.addSeparator()
         action_select_all = menu.addAction("Select All Tracks")
 
@@ -2273,6 +2421,11 @@ class MainWindow(QMainWindow):
             self._on_delete_selected_tracks()
         elif action_change_inst and chosen == action_change_inst:
             self._on_change_instrument_selected_track()
+        elif not multi and chosen in auto_actions:
+            role, platform = auto_actions[chosen]
+            self._on_auto_change_instrument(row, role, platform)
+        elif not multi and chosen in vol_actions:
+            self._on_auto_volume(row, vol_actions[chosen])
         elif chosen == action_select_all:
             self.list_tracks.selectAll()
 
@@ -2354,6 +2507,53 @@ class MainWindow(QMainWindow):
         self._refresh_track_list()
         self.list_tracks.setCurrentRow(row)
         self.status.showMessage(f"Instrument changed: {track.name} → {track.instrument_name}", 2500)
+
+    def _on_auto_volume(self, row: int, role: str):
+        """Set track volume to the recommended level for the given role."""
+        if row < 0 or row >= len(self.project.tracks):
+            return
+        track = self.project.tracks[row]
+        vol = _AUTO_VOLUME_ROLES.get(role)
+        if vol is None:
+            return
+        self._push_project_undo("Set Volume (Auto)")
+        track.volume = vol
+        # Sync the volume slider if this track is currently selected
+        if self.project.selected_track_index == row:
+            self.track_volume.blockSignals(True)
+            self.track_volume.setValue(int(vol * 100))
+            self.track_volume.blockSignals(False)
+        self._refresh_track_list()
+        self.list_tracks.setCurrentRow(row)
+        self.status.showMessage(
+            f"Auto-volume: {track.name} → {int(vol * 100)}%  ({role})", 3000
+        )
+
+    def _on_auto_change_instrument(self, row: int, role: str, platform: str):
+        """Auto-assign the best instrument for a given role and platform."""
+        import random as _rand
+        if row < 0 or row >= len(self.project.tracks):
+            return
+        track = self.project.tracks[row]
+        role_map = ROLE_INSTRUMENT_MAP.get(role)
+        if not role_map:
+            return
+
+        if platform == "Random":
+            platform = _rand.choice([p for p in role_map.keys()])
+
+        inst = role_map.get(platform)
+        if not inst:
+            return
+
+        self._push_project_undo("Change Instrument (Auto)")
+        track.instrument_name = inst["name"]
+        track.waveform = inst["waveform"]
+        self._refresh_track_list()
+        self.list_tracks.setCurrentRow(row)
+        self.status.showMessage(
+            f"Auto-instrument: {track.name} → {inst['name']}  ({role} / {platform})", 3000
+        )
 
     # ── Export WAV ──────────────────────────────────────────────────
 
@@ -2442,6 +2642,90 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             dlg.close()
             QMessageBox.warning(self, "Export Error", str(exc))
+
+    # ── Export Music Sheet ──────────────────────────────────────────
+
+    def _on_export_sheet(self):
+        """Export the project as a music-sheet image (PNG or PDF)."""
+        if not self.project.tracks:
+            self.status.showMessage("Nothing to export — add tracks first.", 2500)
+            return
+
+        # Pick save location
+        try:
+            path, chosen_filter = QFileDialog.getSaveFileName(
+                self, "Export Music Sheet", "",
+                "PNG Image (*.png);;PDF Document (*.pdf)",
+            )
+        except KeyboardInterrupt:
+            return
+        if not path:
+            return
+        # Ensure extension
+        if not (path.lower().endswith(".png") or path.lower().endswith(".pdf")):
+            if "PDF" in chosen_filter:
+                path += ".pdf"
+            else:
+                path += ".png"
+
+        # Show a progress dialog
+        dlg = QProgressDialog("Rendering music sheet\u2026", "Cancel", 0, 100, self)
+        dlg.setWindowTitle("Exporting Music Sheet")
+        dlg.setMinimumWidth(380)
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+
+        cancelled = False
+
+        def _on_cancel():
+            nonlocal cancelled
+            cancelled = True
+
+        dlg.canceled.connect(_on_cancel)
+
+        def _progress(pct: int, msg: str) -> None:
+            if cancelled:
+                raise RuntimeError("Export cancelled")
+            try:
+                dlg.setValue(pct)
+                dlg.setLabelText(msg)
+            except RuntimeError:
+                pass
+            # NOTE: processEvents() intentionally removed — it allows
+            # re-entrant UI handlers to fire mid-export and crash.
+
+        try:
+            export_sheet_image(
+                self.project, path,
+                bars_per_line=4,
+                dpi=200,
+                progress_callback=_progress,
+            )
+            dlg.setValue(100)
+            dlg.setLabelText("Done!")
+            dlg.close()
+
+            QMessageBox.information(
+                self, "Export Complete",
+                f"Music sheet exported to:\n{path}",
+            )
+            self.status.showMessage(f"Exported sheet → {path}", 5000)
+
+        except RuntimeError as exc:
+            dlg.close()
+            if "cancel" in str(exc).lower():
+                self.status.showMessage("Export cancelled.", 2500)
+            else:
+                tb = traceback.format_exc()
+                QMessageBox.warning(self, "Export Error",
+                                    f"{exc}\n\n{tb}")
+        except Exception as exc:
+            dlg.close()
+            tb = traceback.format_exc()
+            QMessageBox.warning(self, "Export Error",
+                                f"{exc}\n\n{tb}")
 
 
 def run_app():
