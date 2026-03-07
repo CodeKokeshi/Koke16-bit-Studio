@@ -45,7 +45,7 @@ from daw.pianoroll import PianoRollEditor, midi_name
 from daw.project_io import ProjectFormatError, load_kokestudio_file, save_kokestudio_file
 from daw.transcriber import audio_to_multitrack_events, load_audio, TranscriptionCancelled
 from daw.instruments import INSTRUMENT_LIBRARY, ROLE_INSTRUMENT_MAP, AUTO_ROLES, AUTO_PLATFORMS
-from daw.theory import SmartTheoryFixer, detect_track_role, remove_gaps, balance_tracks, fix_loops
+from daw.theory import SmartTheoryFixer, detect_track_role, remove_gaps, balance_tracks, fix_loops, _NOTE_NAMES
 from daw.undo import ProjectUndoManager
 from daw.sheet_reader import SheetReaderThread
 from daw.themes import DEFAULT_MODE, DEFAULT_THEME, get_theme_qss
@@ -2015,12 +2015,12 @@ class MainWindow(QMainWindow):
     # ── Beautify ───────────────────────────────────────────────────
 
     def _on_beautify(self):
-        """Analyse tracks and apply role-specific music-theory beautification."""
+        """Analyse the full project context, then apply intelligent
+        chord-aware, groove-aware, phrase-aware beautification."""
         if not self.project.tracks:
             QMessageBox.information(self, "Beautify", "No tracks to beautify.")
             return
 
-        # Determine current track name (if any)
         sel = self.project.selected_track
         cur_name = sel.name if sel else None
 
@@ -2032,6 +2032,7 @@ class MainWindow(QMainWindow):
 
         apply_all = dlg.apply_to_all()
         loop_aware = dlg.loop_aware()
+        strictness = dlg.strictness()
 
         if apply_all:
             targets = list(range(len(self.project.tracks)))
@@ -2043,39 +2044,85 @@ class MainWindow(QMainWindow):
             targets = [idx]
 
         try:
-            fixer = SmartTheoryFixer(strictness=0.75)
-            summary_lines: list[str] = []
+            fixer = SmartTheoryFixer(strictness=strictness)
 
-            for ti in targets:
-                track = self.project.tracks[ti]
-                if not track.notes:
-                    summary_lines.append(f"  {track.name}: skipped (no notes)")
-                    continue
-
-                # Auto-detect role from notes + instrument + track name
+            # ── Phase 1: detect roles for every track ─────────────
+            all_roles: list[str] = []
+            for track in self.project.tracks:
                 role = detect_track_role(
                     track.notes,
                     waveform=track.waveform,
                     instrument_name=track.instrument_name,
                     track_name=track.name,
                 )
+                all_roles.append(role)
+
+            # ── Phase 2: multi-track analysis ─────────────────────
+            all_notes = [t.notes for t in self.project.tracks]
+            analysis = fixer.analyze_project(
+                all_notes, all_roles, self.project.ticks_per_beat,
+            )
+
+            # Build chord progression summary for the dialog
+            key_name = _NOTE_NAMES[analysis.key_root]
+            key_label = f"{key_name} {analysis.key_quality}"
+            chord_prog_str = " → ".join(
+                f"{_NOTE_NAMES[r.root_pc]}{r.quality}"
+                for r in analysis.chord_regions[:12]
+            )
+            if len(analysis.chord_regions) > 12:
+                chord_prog_str += " …"
+
+            summary_lines: list[str] = [
+                f"Detected key: {key_label}",
+                f"Chord progression: {chord_prog_str}",
+                f"Groove grid: {analysis.groove_grid} ticks"
+                + (f" (swing {analysis.swing_amount:.0%})" if analysis.swing_amount > 0.05 else " (straight)"),
+                f"Phrases detected: {len(analysis.phrase_boundaries)}",
+                "",
+            ]
+
+            # ── Phase 3: beautify target tracks ──────────────────
+            for ti in targets:
+                track = self.project.tracks[ti]
+                role = all_roles[ti]
+
+                if not track.notes:
+                    summary_lines.append(f"  {track.name}: skipped (no notes)")
+                    continue
 
                 before_count = len(track.notes)
                 track.notes = fixer.beautify(
                     track.notes,
                     role=role,
                     ticks_per_beat=self.project.ticks_per_beat,
+                    analysis=analysis,
                 )
                 after_count = len(track.notes)
 
                 summary_lines.append(
-                    f"  {track.name}: detected as {role.upper()} "
+                    f"  {track.name}: {role.upper()} "
                     f"({before_count}→{after_count} notes)"
                 )
 
+            # ── Phase 4: inter-track coherence ───────────────────
+            if apply_all and len(targets) > 1:
+                target_notes = [self.project.tracks[ti].notes for ti in targets]
+                target_roles = [all_roles[ti] for ti in targets]
+                fixer._fix_intertrack_clashes(
+                    target_notes, target_roles, analysis,
+                    self.project.ticks_per_beat,
+                )
+                # Write back
+                for ti, notes in zip(targets, target_notes):
+                    self.project.tracks[ti].notes = notes
+                summary_lines.append("")
+                summary_lines.append("Inter-track coherence pass applied")
+
+            # ── Phase 5: loop-aware post-pass ────────────────────
             if loop_aware:
-                all_notes = [t.notes for t in self.project.tracks]
-                balanced = balance_tracks(all_notes, self.project.ticks_per_beat)
+                loop_notes = [t.notes for t in self.project.tracks]
+                balanced = balance_tracks(loop_notes, self.project.ticks_per_beat)
                 stabilized = fix_loops(balanced, self.project.ticks_per_beat)
                 for i, tr in enumerate(self.project.tracks):
                     tr.notes = stabilized[i]
@@ -2084,12 +2131,11 @@ class MainWindow(QMainWindow):
                 summary_lines.append("  • Balanced track lengths to shared loop boundary")
                 summary_lines.append("  • Smoothed end→start transition for seamless restart")
 
-            # Refresh the piano-roll if the current track was touched
+            # Refresh display
             if self.project.selected_track_index in targets:
                 track = self.project.tracks[self.project.selected_track_index]
                 self.editor.set_track(track)
 
-            # Invalidate audio cache (note data changed)
             self.audio._cache.clear()
 
             summary = "\n".join(summary_lines)
@@ -2097,7 +2143,7 @@ class MainWindow(QMainWindow):
                 self,
                 "✨ Beautify Complete",
                 (
-                    "Music-theory beautification applied"
+                    "Context-aware beautification applied"
                     + (" (loop-aware mode):" if loop_aware else ":")
                     + f"\n\n{summary}"
                 ),

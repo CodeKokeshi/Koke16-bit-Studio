@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QRadioButton,
+    QSlider,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -161,23 +162,24 @@ class AudioToMusicDialog(QDialog):
 
 
 class BeautifyDialog(QDialog):
-    """Ask the user whether to beautify the current track or all tracks."""
+    """Configure and launch context-aware music-theory beautification."""
 
     def __init__(self, current_track_name: str | None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("✨ Beautify Tracks")
-        self.resize(430, 260)
+        self.resize(460, 380)
 
         layout = QVBoxLayout(self)
 
-        title = QLabel("Apply music-theory beautification")
+        title = QLabel("Context-aware music-theory beautification")
         title.setStyleSheet("font-size: 15px; font-weight: 700;")
         layout.addWidget(title)
 
         desc = QLabel(
-            "Analyses each track's role (lead / bass / harmony / drums) "
-            "from its pitch range, instrument, and note patterns, then "
-            "applies role-appropriate music theory corrections."
+            "Analyses the full project to detect key, chord progression, "
+            "groove feel, and phrase structure.  Then fixes wrong notes, "
+            "rhythmic inconsistencies, and dynamic imbalances — all "
+            "relative to what the music is trying to accomplish."
         )
         desc.setWordWrap(True)
         desc.setStyleSheet("color: #9a9a9a; font-size: 11px;")
@@ -187,7 +189,7 @@ class BeautifyDialog(QDialog):
             f"Current track only ({current_track_name})" if current_track_name
             else "Current track only"
         )
-        self.radio_all = QRadioButton("All tracks")
+        self.radio_all = QRadioButton("All tracks (enables inter-track coherence)")
         self.radio_current.setChecked(True)
         if not current_track_name:
             self.radio_current.setEnabled(False)
@@ -201,6 +203,37 @@ class BeautifyDialog(QDialog):
         layout.addWidget(self.radio_current)
         layout.addWidget(self.radio_all)
 
+        # ── Strictness slider ─────────────────────────────────────
+        strict_title = QLabel("Strictness")
+        strict_title.setStyleSheet("font-size: 13px; font-weight: 600; margin-top: 6px;")
+        layout.addWidget(strict_title)
+
+        strict_row = QHBoxLayout()
+        strict_row.addWidget(QLabel("Gentle"))
+        self.slider_strict = QSlider(Qt.Orientation.Horizontal)
+        self.slider_strict.setRange(0, 100)
+        self.slider_strict.setValue(75)
+        self.slider_strict.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.slider_strict.setTickInterval(25)
+        strict_row.addWidget(self.slider_strict, 1)
+        strict_row.addWidget(QLabel("Strict"))
+        self._strict_label = QLabel("75 %")
+        self._strict_label.setFixedWidth(42)
+        strict_row.addWidget(self._strict_label)
+        self.slider_strict.valueChanged.connect(
+            lambda v: self._strict_label.setText(f"{v} %"),
+        )
+        layout.addLayout(strict_row)
+
+        strict_desc = QLabel(
+            "Low = preserve character, fix only obvious errors.  "
+            "High = enforce strict theory (more corrections)."
+        )
+        strict_desc.setWordWrap(True)
+        strict_desc.setStyleSheet("color: #7a7a7a; font-size: 10px;")
+        layout.addWidget(strict_desc)
+
+        # ── Playback intent ───────────────────────────────────────
         mode_title = QLabel("Playback intent")
         mode_title.setStyleSheet("font-size: 13px; font-weight: 600; margin-top: 6px;")
         layout.addWidget(mode_title)
@@ -229,6 +262,9 @@ class BeautifyDialog(QDialog):
 
     def loop_aware(self) -> bool:
         return self.radio_loop.isChecked()
+
+    def strictness(self) -> float:
+        return self.slider_strict.value() / 100.0
 
 
 class RoleInstrumentDialog(QDialog):
