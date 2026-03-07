@@ -137,6 +137,26 @@ class ChordRegion:
 
 
 @dataclass
+class SectionRegion:
+    """A structural section of the song (verse, chorus, bridge, etc.)."""
+    start_tick: int
+    end_tick: int
+    label: str          # "A", "B", "C", …
+    energy: float = 0.5  # 0.0–1.0 average normalised energy
+
+
+@dataclass
+class SectionAnalysis:
+    """Per-section musical analysis."""
+    section: SectionRegion
+    key_root: int
+    key_quality: str
+    scale_pcs: set[int]
+    chord_regions: list[ChordRegion]
+    phrase_boundaries: list[tuple[int, int]]
+
+
+@dataclass
 class ProjectAnalysis:
     """Complete analysis of a multi-track project."""
     key_root: int
@@ -147,6 +167,9 @@ class ProjectAnalysis:
     groove_grid: int        # detected quantisation grid in ticks
     swing_amount: float     # 0.0 = straight, 0.3+ = swing feel
     phrase_boundaries: list[tuple[int, int]]  # (start_tick, end_tick)
+    sections: list[SectionAnalysis] = field(default_factory=list)
+    loop_aware: bool = False
+    total_ticks: int = 0
 
 
 def _detect_chord_progression(
@@ -155,27 +178,29 @@ def _detect_chord_progression(
     key_root: int,
     key_quality: str,
     scale_pcs: set[int],
+    harmony_notes: Sequence[NoteEvent] | None = None,
+    bass_notes: Sequence[NoteEvent] | None = None,
 ) -> list[ChordRegion]:
-    """Detect the implied chord at each beat by template matching.
+    """Read chords from the actual music rather than brute-force template matching.
 
-    Analyses all sounding notes per beat, scores every root × quality
-    combination, and picks the best.  Bass notes receive extra weight
-    since the lowest sounding pitch strongly signals the chord root.
-    Continuity and diatonic preference act as tiebreakers.
+    Prioritises the harmony track (if provided) as the chord source,
+    uses the bass track to confirm/set the root, and falls back to all
+    pitched notes otherwise.  The chord's ``chord_pcs`` field stores
+    the *actual* sounding pitch classes — not an idealised template — so
+    downstream corrections respect what the music is really doing.
+
+    Only AFTER reading the sounding notes do we label the quality
+    (major / minor / etc.) by finding the closest known template, purely
+    for display purposes.  The raw ``chord_pcs`` is what matters for
+    note classification and correction.
     """
     if not all_notes:
         return []
 
     last_tick = max(n.start_tick + n.length_tick for n in all_notes)
     beat = max(1, ticks_per_beat)
-
-    # Build diatonic lookup for bonus scoring
-    diatonic = _DIATONIC_MAJOR if key_quality == "major" else _DIATONIC_MINOR
-    diatonic_chords: dict[int, set[int]] = {}
-    for deg, qual in diatonic.items():
-        root_pc = (key_root + deg) % 12
-        intervals = _CHORD_TEMPLATES[qual]
-        diatonic_chords[root_pc] = {(root_pc + iv) % 12 for iv in intervals}
+    harm = list(harmony_notes) if harmony_notes else []
+    bass = list(bass_notes) if bass_notes else []
 
     regions: list[ChordRegion] = []
     prev: ChordRegion | None = None
@@ -183,24 +208,27 @@ def _detect_chord_progression(
     for b_start in range(0, last_tick, beat):
         b_end = b_start + beat
 
-        # Collect sounding notes for this beat window
-        pc_weight = [0.0] * 12
-        bass_pc_weight = [0.0] * 12
-        total_w = 0.0
+        # ── Collect sounding PCs per role ────────────────────────
+        def _collect(src: Sequence[NoteEvent]) -> dict[int, float]:
+            pcs: dict[int, float] = {}
+            for n in src:
+                n_end = n.start_tick + n.length_tick
+                if n.start_tick >= b_end or n_end <= b_start:
+                    continue
+                overlap = min(n_end, b_end) - max(n.start_tick, b_start)
+                w = overlap * (n.velocity / 127.0)
+                pc = n.midi_note % 12
+                pcs[pc] = pcs.get(pc, 0.0) + w
+            return pcs
 
-        for n in all_notes:
-            n_end = n.start_tick + n.length_tick
-            if n.start_tick >= b_end or n_end <= b_start:
-                continue
-            overlap = min(n_end, b_end) - max(n.start_tick, b_start)
-            w = overlap * (n.velocity / 127.0)
-            pc = n.midi_note % 12
-            pc_weight[pc] += w
-            total_w += w
-            if n.midi_note < 52:
-                bass_pc_weight[pc] += w * 2.0
+        harm_pcs = _collect(harm)
+        bass_pcs = _collect(bass)
+        all_pcs = _collect(all_notes)
 
-        if total_w == 0.0:
+        # Primary chord source: harmony if it has ≥2 PCs, else merged
+        chord_src = harm_pcs if len(harm_pcs) >= 2 else all_pcs
+
+        if not chord_src:
             # Silence — carry previous chord
             if prev:
                 regions.append(ChordRegion(
@@ -208,81 +236,65 @@ def _detect_chord_progression(
                     prev.chord_pcs, 0.2,
                 ))
             else:
-                # Default to tonic
                 qual = "maj" if key_quality == "major" else "min"
                 regions.append(ChordRegion(b_start, b_end, key_root, qual))
+            prev = regions[-1]
             continue
 
-        # Count distinct pitch classes sounding on this beat
-        active_pcs = sum(1 for w in pc_weight if w > 0)
-
-        # If only 1 pitch class, we can't confidently identify a chord.
-        # Carry the previous chord forward (or default to tonic).
-        if active_pcs < 2:
+        if len(chord_src) < 2:
             if prev:
                 regions.append(ChordRegion(
                     b_start, b_end, prev.root_pc, prev.quality,
                     prev.chord_pcs, 0.3,
                 ))
-                prev = regions[-1]
             else:
                 qual = "maj" if key_quality == "major" else "min"
                 regions.append(ChordRegion(b_start, b_end, key_root, qual))
-                prev = regions[-1]
+            prev = regions[-1]
             continue
 
-        best_score = -1e9
-        best_root = key_root
-        best_qual = "maj" if key_quality == "major" else "min"
+        # ── Determine root ────────────────────────────────────────
+        if bass_pcs:
+            root_pc = max(bass_pcs, key=lambda k: bass_pcs[k])
+        else:
+            # Lowest-sounding pitch in this beat
+            lowest_note = min(
+                (n for n in all_notes
+                 if n.start_tick < b_end and n.start_tick + n.length_tick > b_start),
+                key=lambda n: n.midi_note,
+                default=None,
+            )
+            root_pc = lowest_note.midi_note % 12 if lowest_note else max(chord_src, key=lambda k: chord_src[k])
 
-        for root in range(12):
-            for qual, intervals in _CHORD_TEMPLATES.items():
-                cpcs = {(root + iv) % 12 for iv in intervals}
-                score = 0.0
+        # ── Build the chord from actual sounding PCs ──────────────
+        sounding_pcs = frozenset(chord_src.keys())
 
-                for pc in range(12):
-                    pw = pc_weight[pc] + bass_pc_weight[pc]
-                    if pw <= 0:
-                        continue
-                    if pc in cpcs:
-                        score += pw * 2.0
-                    elif pc in scale_pcs:
-                        score += pw * 0.3
-                    else:
-                        score -= pw * 1.5
+        # ── Label quality (for display only; chord_pcs is truth) ──
+        intervals = frozenset((pc - root_pc) % 12 for pc in sounding_pcs)
+        best_quality = "?"
+        best_match = 0
+        for qual_name, tpl_intervals in _CHORD_TEMPLATES.items():
+            tpl_set = frozenset(tpl_intervals)
+            match_count = len(intervals & tpl_set)
+            if match_count > best_match or (match_count == best_match and len(tpl_intervals) > len(_CHORD_TEMPLATES.get(best_quality, []))):
+                best_match = match_count
+                best_quality = qual_name
 
-                # Bass-root bonus
-                score += bass_pc_weight[root] * 1.5
-
-                # Continuity bonus (prefer keeping the same chord)
-                if prev and root == prev.root_pc and qual == prev.quality:
-                    score += total_w * 0.25
-
-                # Diatonic bonus
-                if root in diatonic_chords:
-                    score += total_w * 0.15
-                    # Extra bonus if the quality also matches diatonic expectation
-                    deg = (root - key_root) % 12
-                    if diatonic.get(deg) == qual:
-                        score += total_w * 0.20
-
-                if score > best_score:
-                    best_score = score
-                    best_root = root
-                    best_qual = qual
-
-        confidence = min(1.0, max(0.0, best_score / max(1.0, total_w * 2)))
-        region = ChordRegion(b_start, b_end, best_root, best_qual, confidence=confidence)
+        confidence = min(1.0, best_match / max(1, len(sounding_pcs)))
+        region = ChordRegion(
+            b_start, b_end, root_pc, best_quality,
+            sounding_pcs, confidence,
+        )
         regions.append(region)
         prev = region
 
-    # Merge consecutive identical chords
+    # Merge consecutive chords that share the same root + sounding PCs
     if not regions:
         return regions
     merged: list[ChordRegion] = [regions[0]]
     for r in regions[1:]:
         m = merged[-1]
-        if m.root_pc == r.root_pc and m.quality == r.quality:
+        if m.root_pc == r.root_pc and m.chord_pcs == r.chord_pcs:
             merged[-1] = ChordRegion(
                 m.start_tick, r.end_tick, m.root_pc, m.quality,
                 m.chord_pcs, (m.confidence + r.confidence) / 2,
@@ -396,6 +408,130 @@ def _detect_phrases(
     return phrases
 
 
+# ─── Section detection ─────────────────────────────────────────────────
+
+def _detect_sections(
+    all_notes: Sequence[NoteEvent],
+    ticks_per_beat: int,
+    phrases: list[tuple[int, int]],
+) -> list[SectionRegion]:
+    """Detect structural sections (A/B/C = verse/chorus/bridge, etc.).
+
+    Divides the music into fixed-size windows (4 bars), computes a
+    multi-feature fingerprint for each (pitch-class histogram **plus**
+    normalised energy and average pitch), and clusters similar windows.
+    Consecutive same-label windows are merged into a single
+    :class:`SectionRegion`.
+    """
+    if not all_notes:
+        return []
+
+    last_tick = max(n.start_tick + n.length_tick for n in all_notes)
+    bar_ticks = ticks_per_beat * 4
+    section_window = bar_ticks * 4  # 4 bars
+
+    if last_tick <= section_window:
+        energy = (sum(n.velocity for n in all_notes) / max(1, len(all_notes))) / 127.0
+        return [SectionRegion(0, last_tick, "A", energy)]
+
+    # ── build per-window fingerprints ─────────────────────────────
+    # Fingerprint = 14-element vector: 12 × PC histogram + normalised
+    # avg-velocity + normalised avg-pitch.  This lets the clustering
+    # differentiate sections that share pitch classes but differ in
+    # energy or register.
+    windows: list[tuple[int, int, list[float], float]] = []
+    for w_start in range(0, last_tick, section_window):
+        w_end = min(w_start + section_window, last_tick)
+        w_notes = [n for n in all_notes
+                   if n.start_tick >= w_start and n.start_tick < w_end]
+
+        pc_hist = [0.0] * 12
+        total_vel = 0.0
+        total_pitch = 0.0
+        for n in w_notes:
+            pc_hist[n.midi_note % 12] += n.length_tick
+            total_vel += n.velocity
+            total_pitch += n.midi_note
+
+        total_h = sum(pc_hist) or 1.0
+        pc_hist = [x / total_h for x in pc_hist]
+
+        n_notes = max(1, len(w_notes))
+        avg_vel = total_vel / n_notes if w_notes else 0.0
+        avg_pitch = total_pitch / n_notes if w_notes else 60.0
+
+        # Normalise velocity (0–1) and pitch (map 24–108 → 0–1)
+        norm_vel = avg_vel / 127.0
+        norm_pitch = max(0.0, min(1.0, (avg_pitch - 24) / 84.0))
+
+        # 14-dim fingerprint • velocity and pitch weighted ×2 so they
+        # are not drowned out by the 12-dim PC histogram
+        fp = pc_hist + [norm_vel * 2.0, norm_pitch * 2.0]
+
+        density = len(w_notes) / max(1, w_end - w_start)
+        energy = min(1.0, (density * 500 + avg_vel) / 200.0)
+        windows.append((w_start, w_end, fp, energy))
+
+    if len(windows) <= 1:
+        return [SectionRegion(0, last_tick, "A", windows[0][3] if windows else 0.5)]
+
+    # ── distance metric ─────────────────────────────────────────
+    # Euclidean distance is more sensitive to the energy/pitch
+    # dimensions than cosine, which is dominated by the PC histogram.
+    def _fp_dist(a: list[float], b: list[float]) -> float:
+        return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+    # ── cluster windows by fingerprint distance ───────────────────
+    label_chars = "ABCDEFGH"
+    labels: list[str] = [""] * len(windows)
+    label_fps: dict[str, list[float]] = {}
+    next_label = 0
+
+    # Adaptive threshold: compute the average pairwise distance
+    dists: list[float] = []
+    for i in range(len(windows)):
+        for j in range(i + 1, len(windows)):
+            dists.append(_fp_dist(windows[i][2], windows[j][2]))
+    if dists:
+        mean_dist = sum(dists) / len(dists)
+        threshold = max(0.15, mean_dist * 0.6)
+    else:
+        threshold = 0.15
+
+    for i, (_, _, fp, _energy) in enumerate(windows):
+        best_lbl: str | None = None
+        best_dist = float("inf")
+        for lbl, lbl_fp in label_fps.items():
+            d = _fp_dist(fp, lbl_fp)
+            if d < best_dist:
+                best_dist = d
+                best_lbl = lbl
+
+        if best_lbl is not None and best_dist < threshold:
+            labels[i] = best_lbl
+        else:
+            lbl = label_chars[min(next_label, len(label_chars) - 1)]
+            next_label += 1
+            labels[i] = lbl
+            label_fps[lbl] = fp
+
+    # ── merge consecutive same-label windows ──────────────────────
+    sections: list[SectionRegion] = []
+    i = 0
+    while i < len(windows):
+        start = windows[i][0]
+        lbl = labels[i]
+        j = i + 1
+        while j < len(windows) and labels[j] == lbl:
+            j += 1
+        end = windows[j - 1][1]
+        avg_energy = sum(windows[k][3] for k in range(i, j)) / max(1, j - i)
+        sections.append(SectionRegion(start, end, lbl, avg_energy))
+        i = j
+
+    return sections
+
+
 # ─── Note-function classification ─────────────────────────────────────
 
 def _classify_note(
@@ -461,12 +597,22 @@ def _classify_track_notes(
     chord_regions: list[ChordRegion],
     scale_pcs: set[int],
     blue_pcs: set[int],
+    loop_aware: bool = False,
 ) -> list[str]:
-    """Return a classification string for every note in *notes* (same order)."""
+    """Return a classification string for every note in *notes* (same order).
+
+    When *loop_aware* the last note's "next" wraps to the first note
+    and vice-versa, so boundary notes are not unfairly penalised.
+    """
+    n = len(notes)
     result: list[str] = []
     for i, note in enumerate(notes):
-        prev_n = notes[i - 1] if i > 0 else None
-        next_n = notes[i + 1] if i < len(notes) - 1 else None
+        if loop_aware and n > 1:
+            prev_n = notes[(i - 1) % n]
+            next_n = notes[(i + 1) % n]
+        else:
+            prev_n = notes[i - 1] if i > 0 else None
+            next_n = notes[i + 1] if i < n - 1 else None
         chord = _chord_at_tick(chord_regions, note.start_tick)
         result.append(_classify_note(note, prev_n, next_n, chord, scale_pcs, blue_pcs))
     return result
@@ -697,29 +843,81 @@ class SmartTheoryFixer:
         tracks_notes: list[list[NoteEvent]],
         tracks_roles: list[str],
         ticks_per_beat: int = 4,
+        loop_aware: bool = False,
     ) -> ProjectAnalysis:
-        """Perform deep analysis of the full project before beautification.
+        """Perform deep, role-aware, section-aware project analysis.
 
-        Combines all pitched tracks to detect key, chord progression,
-        groove feel, and phrase structure so that every subsequent
-        per-track correction is informed by the full musical context.
+        1. Separate notes by role (harmony defines chords, bass confirms
+           roots, lead/other are context).
+        2. Detect global key from all pitched notes.
+        3. Read chords from the music — harmony track has priority.
+        4. Detect groove, phrases, and structural sections.
+        5. Build per-section sub-analyses (local key, local chords,
+           local phrases) so beautification can adapt to each part.
         """
-        # Merge all pitched notes for global analysis
+        # ── 1) separate by role ───────────────────────────────────
         all_pitched: list[NoteEvent] = []
+        harmony_notes: list[NoteEvent] = []
+        bass_notes: list[NoteEvent] = []
         for notes, role in zip(tracks_notes, tracks_roles):
-            if role != "drums":
-                all_pitched.extend(notes)
+            if role == "drums":
+                continue
+            all_pitched.extend(notes)
+            if role == "harmony":
+                harmony_notes.extend(notes)
+            elif role == "bass":
+                bass_notes.extend(notes)
 
+        # ── 2) global key ────────────────────────────────────────
         root, quality, scale_pcs = _detect_key(all_pitched)
         blue_pcs = _get_blue_pcs(root, quality)
 
+        # ── 3) bottom-up chord reading from harmony + bass ───────
         chord_regions = _detect_chord_progression(
             all_pitched, ticks_per_beat, root, quality, scale_pcs,
+            harmony_notes=harmony_notes or None,
+            bass_notes=bass_notes or None,
         )
 
+        # ── 4) groove / phrases / sections ────────────────────────
         groove_grid, swing = _detect_groove(all_pitched, ticks_per_beat)
-
         phrases = _detect_phrases(all_pitched, ticks_per_beat)
+        sections = _detect_sections(all_pitched, ticks_per_beat, phrases)
+
+        # ── 5) per-section sub-analyses ───────────────────────────
+        section_analyses: list[SectionAnalysis] = []
+        for sec in sections:
+            s_all = [n for n in all_pitched
+                     if n.start_tick >= sec.start_tick and n.start_tick < sec.end_tick]
+            s_harm = [n for n in harmony_notes
+                      if n.start_tick >= sec.start_tick and n.start_tick < sec.end_tick]
+            s_bass = [n for n in bass_notes
+                      if n.start_tick >= sec.start_tick and n.start_tick < sec.end_tick]
+
+            # Local key — fall back to global if section is too short
+            if len(s_all) >= 8:
+                s_root, s_qual, s_scale = _detect_key(s_all)
+            else:
+                s_root, s_qual, s_scale = root, quality, scale_pcs
+
+            s_chords = _detect_chord_progression(
+                s_all, ticks_per_beat, s_root, s_qual, s_scale,
+                harmony_notes=s_harm or None,
+                bass_notes=s_bass or None,
+            )
+            s_phrases = [(s, e) for s, e in phrases
+                         if s >= sec.start_tick and e <= sec.end_tick]
+
+            section_analyses.append(SectionAnalysis(
+                section=sec,
+                key_root=s_root,
+                key_quality=s_qual,
+                scale_pcs=s_scale,
+                chord_regions=s_chords,
+                phrase_boundaries=s_phrases,
+            ))
+
+        total_ticks = max((n.start_tick + n.length_tick for n in all_pitched), default=0)
 
         return ProjectAnalysis(
             key_root=root,
@@ -730,6 +928,9 @@ class SmartTheoryFixer:
             groove_grid=groove_grid,
             swing_amount=swing,
             phrase_boundaries=phrases,
+            sections=section_analyses,
+            loop_aware=loop_aware,
+            total_ticks=total_ticks,
         )
 
     def beautify(
@@ -739,27 +940,25 @@ class SmartTheoryFixer:
         ticks_per_beat: int = 4,
         analysis: ProjectAnalysis | None = None,
     ) -> list[NoteEvent]:
-        """Context-aware music-theory beautification.
+        """Context-aware, section-aware, loop-aware beautification.
 
-        When *analysis* is supplied (from ``analyze_project``), every
-        correction is informed by the detected chord progression,
-        groove feel, and phrase structure of the whole project.
-        Without it, a single-track fallback analysis is performed.
+        When *analysis* contains per-section sub-analyses, each note is
+        corrected against the *local* chord/key context of its own
+        section rather than a single global pass.  When
+        ``analysis.loop_aware`` is True, the pipeline treats the music
+        as circular — the end wraps to the start for classification,
+        gap filling, and dynamics, preventing the boundary from
+        becoming chaotic.
 
         **Pipeline (all pitched roles):**
 
-        1. *Analyse* — detect key, chords, groove, phrases.
-        2. *Classify* — label every note's function (chord tone,
-           passing tone, blue note, wrong note, …).
-        3. *Fix wrong notes* — snap only truly wrong notes to the
-           nearest chord tone (not just the nearest scale tone).
-        4. *Role-specific* — lead smoothing, bass root-lock,
-           harmony voice-leading, drum tightening.
-        5. *Groove quantise* — quantise to the detected grid and
-           swing feel (not a rigid mechanical grid).
-        6. *Phrase dynamics* — shape velocity arcs so phrases
-           breathe naturally.
-        7. *Final cleanup* — remove overlaps, re-sort.
+        1. *Classify* notes per section (section-local chords & key).
+        2. *Fix wrong notes* per section.
+        3. *Role-specific* passes (lead / bass / harmony / drums).
+        4. *Groove quantise* (detected grid + swing).
+        5. *Phrase dynamics* — but **skip end-of-song diminuendo**
+           when loop-aware.
+        6. *Final cleanup* — overlaps, re-sort.
         """
         if not notes:
             return notes
@@ -790,11 +989,28 @@ class SmartTheoryFixer:
             )
 
         a = analysis  # shorthand
+        loop = a.loop_aware
 
-        # ── 1) classify every note ────────────────────────────────
-        classifications = _classify_track_notes(notes, a.chord_regions, a.scale_pcs, a.blue_pcs)
+        # ── 1) classify — use section-local analysis when available ──
+        if a.sections:
+            classifications: list[str] = ["scale_tone"] * len(notes)
+            for sa in a.sections:
+                sec = sa.section
+                blue = _get_blue_pcs(sa.key_root, sa.key_quality)
+                for i, note in enumerate(notes):
+                    if sec.start_tick <= note.start_tick < sec.end_tick:
+                        prev_n = notes[i - 1] if i > 0 else (notes[-1] if loop and len(notes) > 1 else None)
+                        next_n = notes[i + 1] if i < len(notes) - 1 else (notes[0] if loop and len(notes) > 1 else None)
+                        chord = _chord_at_tick(sa.chord_regions, note.start_tick)
+                        classifications[i] = _classify_note(
+                            note, prev_n, next_n, chord, sa.scale_pcs, blue,
+                        )
+        else:
+            classifications = _classify_track_notes(
+                notes, a.chord_regions, a.scale_pcs, a.blue_pcs, loop,
+            )
 
-        # ── 2) fix wrong notes (chord-context-aware) ─────────────
+        # ── 2) fix wrong notes (section-context-aware) ───────────
         notes = self._fix_wrong_notes(notes, classifications, a)
 
         # ── 3) role-specific passes ───────────────────────────────
@@ -809,7 +1025,7 @@ class SmartTheoryFixer:
         notes = self._quantize_to_groove(notes, a.groove_grid, a.swing_amount)
 
         # ── 5) phrase-aware dynamics ──────────────────────────────
-        notes = self._shape_phrase_dynamics(notes, a.phrase_boundaries, role)
+        notes = self._shape_phrase_dynamics(notes, a.phrase_boundaries, role, loop)
 
         # ── 6) final cleanup ──────────────────────────────────────
         notes = self._remove_overlaps(notes)
@@ -826,10 +1042,9 @@ class SmartTheoryFixer:
     ) -> list[NoteEvent]:
         """Correct notes classified as ``'wrong'``.
 
-        Unlike the old approach (snap to nearest scale tone), this
-        considers the *current chord* at the note's position and snaps
-        to the nearest **chord tone** first, falling back to scale
-        tones only when the chord tone would be too far away.
+        Uses the **section-local** chord and scale context when sections
+        are available, so a note that is "wrong" in one key is corrected
+        using the *local* key, not the global one.
 
         Long or loud wrong notes are treated more gently — they may
         be intentional dissonance, so they are only nudged by 1
@@ -838,33 +1053,45 @@ class SmartTheoryFixer:
         med_len = _median_length(notes)
         med_vel = _median_velocity(notes)
 
+        # Build a quick section lookup
+        sec_map: list[SectionAnalysis | None] = []
+        if analysis.sections:
+            for note in notes:
+                found = None
+                for sa in analysis.sections:
+                    if sa.section.start_tick <= note.start_tick < sa.section.end_tick:
+                        found = sa
+                        break
+                sec_map.append(found)
+        else:
+            sec_map = [None] * len(notes)
+
         for i, (note, cls) in enumerate(zip(notes, classifications)):
             if cls != "wrong":
                 continue
 
-            chord = _chord_at_tick(analysis.chord_regions, note.start_tick)
-            target_pcs = chord.chord_pcs if chord else analysis.scale_pcs
+            sa = sec_map[i]
+            local_chords = sa.chord_regions if sa else analysis.chord_regions
+            local_scale = sa.scale_pcs if sa else analysis.scale_pcs
+
+            chord = _chord_at_tick(local_chords, note.start_tick)
+            target_pcs = chord.chord_pcs if chord else local_scale
 
             is_long = note.length_tick >= med_len * (1.5 - self.strictness * 0.8)
             is_loud = note.velocity >= med_vel * (1.2 - self.strictness * 0.3)
 
             if is_long or is_loud:
-                # Gentle nudge — intentional dissonance?  Move at most 1 semitone
-                # toward the nearest chord tone.
                 if self.strictness >= 0.7:
                     nearest = _nearest_scale_tone(note.midi_note, target_pcs)
                     diff = nearest - note.midi_note
                     if abs(diff) <= 2:
                         note.midi_note = nearest
                     else:
-                        # Nudge one semitone in the right direction
                         note.midi_note += (1 if diff > 0 else -1)
             else:
-                # Short / quiet → snap to nearest chord tone
                 nearest_chord = _nearest_scale_tone(note.midi_note, target_pcs)
-                # If chord tone is too far (>3 semitones), use scale tone instead
                 if abs(nearest_chord - note.midi_note) > 3:
-                    nearest_chord = _nearest_scale_tone(note.midi_note, analysis.scale_pcs)
+                    nearest_chord = _nearest_scale_tone(note.midi_note, local_scale)
                 note.midi_note = nearest_chord
 
         return notes
@@ -1220,12 +1447,16 @@ class SmartTheoryFixer:
         notes: list[NoteEvent],
         phrases: list[tuple[int, int]],
         role: str,
+        loop_aware: bool = False,
     ) -> list[NoteEvent]:
         """Shape velocity curves to give phrases a natural breathing arc.
 
         Each phrase gets a slight crescendo toward ~60 % of its length
-        and a diminuendo toward its end.  The intensity of shaping is
-        controlled by ``strictness``.
+        and a diminuendo toward its end.
+
+        When *loop_aware* is True the **last phrase** keeps a flat arc
+        (no diminuendo) so the transition back to the start is smooth
+        rather than dying out.
         """
         if not notes or not phrases:
             return notes
@@ -1235,6 +1466,7 @@ class SmartTheoryFixer:
         target = targets.get(role, 90)
 
         shape_intensity = 0.1 + self.strictness * 0.25  # 0.1..0.35
+        last_phrase = phrases[-1] if phrases else None
 
         for note in notes:
             # Find which phrase this note belongs to
@@ -1250,8 +1482,11 @@ class SmartTheoryFixer:
             p_len = max(1, p_end - p_start)
             position = (note.start_tick - p_start) / p_len  # 0..1
 
-            # Arc: rises to peak at ~60%, then descends
-            if position <= 0.6:
+            # When loop-aware and this is the last phrase, keep dynamics
+            # flat so the music doesn't die before wrapping back.
+            if loop_aware and phrase == last_phrase:
+                arc = 1.0
+            elif position <= 0.6:
                 # Rising: 0.85 → 1.1
                 arc = 0.85 + (position / 0.6) * 0.25
             else:
@@ -1863,36 +2098,18 @@ def fix_loops(
 ) -> list[list[NoteEvent]]:
     """Make the end→start transition seamless for looping playback.
 
-    When a piece loops, the jump from the last tick back to the first
-    tick often sounds jarring: sudden silence, abrupt pitch jumps,
-    velocity spikes, or rhythmic discontinuity.  This function smooths
-    the transition so the loop feels like a continuous performance.
+    This is intentionally *gentle* — the heavy lifting (no end-of-song
+    diminuendo, wrapped note classification) is already handled by the
+    loop-aware beautify pipeline.  This pass only:
 
-    **Techniques applied (per track):**
+    1. **Rhythmic alignment** — snap track length to a clean bar
+       boundary so the loop doesn't drift off-grid.
+    2. **Soft velocity crossfade** — slight fade-out in the last beat
+       and fade-in on the first beat to soften the seam.
 
-    1. **Velocity crossfade** — notes in the last ~2 beats are gently
-       faded out while notes in the first ~2 beats are gently faded in.
-       This prevents the hard cut.
-
-    2. **Tail extension** — if the last note ends well before the loop
-       boundary, a "sustain tail" note is added to carry the sound
-       into the restart.
-
-    3. **Pitch contour bridging** — the last few notes' pitch direction
-       is analysed.  If the ending contour clashes with the opening
-       (e.g., melody rises at the end but starts on a note far below),
-       the final notes are adjusted to create a stepwise approach
-       toward the first note, using scale-aware movement.
-
-    4. **Pickup / anacrusis note** — if there's a gap between the loop
-       end and the first note of the track, a quiet "pickup" note is
-       placed just before tick 0 (using the track's opening pitch)
-       to bridge the silence.
-
-    5. **Rhythmic alignment** — if the track's total length doesn't
-       land on a clean beat boundary, the last note is trimmed or
-       extended to align with the nearest beat, preventing the loop
-       from drifting off-grid.
+    Previous behaviours (pitch rewriting, pickup notes, bridge notes)
+    were removed because they introduced notes that didn't belong in the
+    original composition and caused audible chaos at the boundary.
 
     Returns a **new** list of note-lists (never mutates the inputs).
     """
@@ -1911,127 +2128,42 @@ def fix_loops(
             continue
 
         track_end = _track_end_tick(notes)
-        first_tick = notes[0].start_tick
 
-        # Detect key for pitch-aware operations
-        root, quality, scale_pcs = _detect_key(notes)
-        sorted_pcs = sorted(scale_pcs)
-
-        # ── 1) Rhythmic alignment — snap track end to beat boundary ──
+        # ── 1) Rhythmic alignment — snap to bar boundary ─────────
         beat_ticks = max(1, ticks_per_beat)
         bar_ticks = beat_ticks * 4  # assume 4/4
 
-        # Round up to next bar boundary for clean loops
         aligned_end = track_end
         remainder = track_end % bar_ticks
         if remainder != 0:
             aligned_end = track_end + (bar_ticks - remainder)
 
-        # Extend the last note to fill the gap if it's close
+        # Extend the last note to fill the gap if the boundary is close
         last_note = notes[-1]
         last_note_end = last_note.start_tick + last_note.length_tick
         gap_to_boundary = aligned_end - last_note_end
-
         if 0 < gap_to_boundary <= bar_ticks:
-            # Extend last note to reach the boundary (sustain)
             last_note.length_tick += gap_to_boundary
 
         track_end = aligned_end
 
-        # ── 2) Velocity crossfade — fade out tail, fade in head ──────
-        fade_window = beat_ticks * 2  # 2 beats
+        # ── 2) Soft velocity crossfade ────────────────────────────
+        fade_window = beat_ticks  # 1 beat (gentle)
 
-        # Fade-out: notes starting in the last fade_window ticks
         fade_out_start = max(0, track_end - fade_window)
         for note in notes:
             if note.start_tick >= fade_out_start:
-                # Linear fade: full volume at fade_out_start → 60% at track_end
                 progress = (note.start_tick - fade_out_start) / max(1, fade_window)
-                fade = 1.0 - (progress * 0.4)  # 1.0 → 0.6
+                fade = 1.0 - (progress * 0.15)  # 1.0 → 0.85
                 note.velocity = max(30, int(note.velocity * fade))
 
-        # Fade-in: notes starting in the first fade_window ticks
+        first_tick = notes[0].start_tick
         fade_in_end = first_tick + fade_window
         for note in notes:
             if note.start_tick < fade_in_end:
                 progress = (note.start_tick - first_tick) / max(1, fade_window)
-                fade = 0.6 + (progress * 0.4)  # 0.6 → 1.0
+                fade = 0.85 + (progress * 0.15)  # 0.85 → 1.0
                 note.velocity = max(30, int(note.velocity * fade))
-
-        # ── 3) Pitch contour bridging ────────────────────────────────
-        #    Analyse last 3-4 notes and first note; adjust if the
-        #    interval is too large (> 7 semitones)
-
-        first_note = notes[0]
-        # Get the last few pitched notes (skip very short ones)
-        tail_notes = [n for n in notes[-6:] if n.length_tick >= 1]
-        if len(tail_notes) >= 2:
-            final_pitch = tail_notes[-1].midi_note
-            opening_pitch = first_note.midi_note
-
-            interval = abs(final_pitch - opening_pitch)
-
-            if interval > 7:
-                # The jump is too large — create a stepwise approach
-                # Adjust the last 2-3 notes to walk toward the opening pitch
-                going_down = final_pitch > opening_pitch
-                n_adjust = min(3, len(tail_notes) - 1)
-
-                for i in range(n_adjust):
-                    idx = len(tail_notes) - 1 - i
-                    if idx < 0:
-                        break
-                    note = tail_notes[idx]
-                    # How far should this note be from the target?
-                    # Last note → closest, earlier notes → farther
-                    steps_away = i + 1
-                    target = opening_pitch
-                    # Step away from target by scale steps
-                    cur = target
-                    for _ in range(steps_away):
-                        cur = _step_in_scale(
-                            cur, sorted_pcs,
-                            going_up=not going_down,
-                        )
-
-                    # Only adjust if it brings the note closer to the target
-                    old_dist = abs(note.midi_note - opening_pitch)
-                    new_dist = abs(cur - opening_pitch)
-                    if new_dist < old_dist:
-                        note.midi_note = cur
-
-        # ── 4) Tail extension — bridge silence at end ────────────────
-        last_note_end = _track_end_tick(notes)
-        silence_at_end = track_end - last_note_end
-
-        if silence_at_end > beat_ticks:
-            # Add a sustain/bridge note using the opening pitch
-            bridge_pitch = first_note.midi_note
-            # Use a quiet velocity for a gentle lead-in
-            bridge_vel = max(30, int(first_note.velocity * 0.5))
-            notes.append(NoteEvent(
-                start_tick=last_note_end,
-                length_tick=silence_at_end,
-                midi_note=bridge_pitch,
-                velocity=bridge_vel,
-            ))
-
-        # ── 5) Pickup / anacrusis — fill silence before first note ───
-        if first_tick > 0 and first_tick >= beat_ticks:
-            # There's a gap before the first note — add a quiet pickup
-            pickup_pitch = first_note.midi_note
-            # Step one scale tone below for an approach effect
-            pickup_pitch = _step_in_scale(pickup_pitch, sorted_pcs, going_up=False)
-            pickup_start = max(0, first_tick - beat_ticks)
-            pickup_len = first_tick - pickup_start
-            pickup_vel = max(30, int(first_note.velocity * 0.45))
-
-            notes.append(NoteEvent(
-                start_tick=pickup_start,
-                length_tick=pickup_len,
-                midi_note=pickup_pitch,
-                velocity=pickup_vel,
-            ))
 
         notes.sort(key=lambda n: n.start_tick)
         result.append(notes)

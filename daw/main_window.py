@@ -2016,7 +2016,7 @@ class MainWindow(QMainWindow):
 
     def _on_beautify(self):
         """Analyse the full project context, then apply intelligent
-        chord-aware, groove-aware, phrase-aware beautification."""
+        section-aware, role-aware, loop-aware beautification."""
         if not self.project.tracks:
             QMessageBox.information(self, "Beautify", "No tracks to beautify.")
             return
@@ -2057,13 +2057,14 @@ class MainWindow(QMainWindow):
                 )
                 all_roles.append(role)
 
-            # ── Phase 2: multi-track analysis ─────────────────────
+            # ── Phase 2: role-aware, section-aware analysis ───────
             all_notes = [t.notes for t in self.project.tracks]
             analysis = fixer.analyze_project(
                 all_notes, all_roles, self.project.ticks_per_beat,
+                loop_aware=loop_aware,
             )
 
-            # Build chord progression summary for the dialog
+            # Build summary
             key_name = _NOTE_NAMES[analysis.key_root]
             key_label = f"{key_name} {analysis.key_quality}"
             chord_prog_str = " → ".join(
@@ -2075,12 +2076,24 @@ class MainWindow(QMainWindow):
 
             summary_lines: list[str] = [
                 f"Detected key: {key_label}",
-                f"Chord progression: {chord_prog_str}",
+                f"Chord progression (read from music): {chord_prog_str}",
                 f"Groove grid: {analysis.groove_grid} ticks"
                 + (f" (swing {analysis.swing_amount:.0%})" if analysis.swing_amount > 0.05 else " (straight)"),
-                f"Phrases detected: {len(analysis.phrase_boundaries)}",
-                "",
+                f"Phrases: {len(analysis.phrase_boundaries)}",
+                f"Sections: {len(analysis.sections)}"
+                + (f" ({', '.join(sa.section.label for sa in analysis.sections)})" if analysis.sections else ""),
             ]
+
+            # Per-section detail
+            for sa in analysis.sections:
+                sec = sa.section
+                s_key = f"{_NOTE_NAMES[sa.key_root]} {sa.key_quality}"
+                summary_lines.append(
+                    f"  Section {sec.label}: ticks {sec.start_tick}–{sec.end_tick}, "
+                    f"key {s_key}, energy {sec.energy:.0%}"
+                )
+
+            summary_lines.append("")
 
             # ── Phase 3: beautify target tracks ──────────────────
             for ti in targets:
@@ -2113,7 +2126,6 @@ class MainWindow(QMainWindow):
                     target_notes, target_roles, analysis,
                     self.project.ticks_per_beat,
                 )
-                # Write back
                 for ti, notes in zip(targets, target_notes):
                     self.project.tracks[ti].notes = notes
                 summary_lines.append("")
@@ -2127,9 +2139,7 @@ class MainWindow(QMainWindow):
                 for i, tr in enumerate(self.project.tracks):
                     tr.notes = stabilized[i]
                 summary_lines.append("")
-                summary_lines.append("Loop-aware post-pass applied:")
-                summary_lines.append("  • Balanced track lengths to shared loop boundary")
-                summary_lines.append("  • Smoothed end→start transition for seamless restart")
+                summary_lines.append("Loop-aware post-pass applied (alignment + crossfade)")
 
             # Refresh display
             if self.project.selected_track_index in targets:
@@ -2143,8 +2153,8 @@ class MainWindow(QMainWindow):
                 self,
                 "✨ Beautify Complete",
                 (
-                    "Context-aware beautification applied"
-                    + (" (loop-aware mode):" if loop_aware else ":")
+                    "Section-aware beautification applied"
+                    + (" (loop-aware):" if loop_aware else ":")
                     + f"\n\n{summary}"
                 ),
             )
